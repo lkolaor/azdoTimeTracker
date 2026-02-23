@@ -1,0 +1,897 @@
+<#
+.SYNOPSIS
+    Terminal UI module for the Azure DevOps Time Tracker.
+.DESCRIPTION
+    Handles rendering the work item list, detail view, status picker, and keyboard input.
+#>
+
+# ── Type icons and colours ─────────────────────────────────────────
+$script:TypeConfig = @{
+    'Epic'                = @{ Icon = [char]0x2605; Color = 'Magenta'     }
+    'Feature'             = @{ Icon = [char]0x25C6; Color = 'DarkMagenta' }
+    'User Story'          = @{ Icon = [char]0x25CF; Color = 'Cyan'        }
+    'Product Backlog Item'= @{ Icon = [char]0x25CF; Color = 'Cyan'        }
+    'Bug'                 = @{ Icon = [char]0x25A0; Color = 'Red'         }
+    'Task'                = @{ Icon = [char]0x25B6; Color = 'Green'       }
+    'Incident'            = @{ Icon = [char]0x26A0; Color = 'Yellow'      }
+    'Issue'               = @{ Icon = [char]0x26A0; Color = 'Yellow'      }
+}
+
+function Get-TypeIcon {
+    param([string]$Type)
+    $cfg = $script:TypeConfig[$Type]
+    if ($cfg) { return $cfg.Icon } else { return [char]0x25CB } # ○
+}
+
+function Get-TypeColor {
+    param([string]$Type)
+    $cfg = $script:TypeConfig[$Type]
+    if ($cfg) { return $cfg.Color } else { return 'White' }
+}
+
+# ── Strip HTML from description ─────────────────────────────────────
+function Remove-Html {
+    param([string]$Html)
+    if (-not $Html) { return "" }
+    # Replace common HTML entities
+    $text = $Html -replace '<br\s*/?>', "`n"
+    $text = $text -replace '<p[^>]*>', "`n"
+    $text = $text -replace '</p>', ""
+    $text = $text -replace '<div[^>]*>', "`n"
+    $text = $text -replace '</div>', ""
+    $text = $text -replace '<li[^>]*>', "  - "
+    $text = $text -replace '</li>', "`n"
+    $text = $text -replace '<[^>]+>', ''
+    $text = [System.Net.WebUtility]::HtmlDecode($text)
+    # Clean up excess blank lines
+    $text = $text -replace "(\r?\n){3,}", "`n`n"
+    return $text.Trim()
+}
+
+# ── Format elapsed time from a Stopwatch ────────────────────────────
+function Format-Elapsed {
+    param([System.Diagnostics.Stopwatch]$SW)
+    $e = $SW.Elapsed
+    [int]$h = [Math]::Floor($e.TotalHours)
+    [int]$m = $e.Minutes
+    [int]$s = $e.Seconds
+    return "{0:D2}:{1:D2}:{2:D2}" -f $h, $m, $s
+}
+
+# ── Calculate display width accounting for wide characters ──────────
+function Get-DisplayWidth {
+    param([string]$Text)
+    if (-not $Text) { return 0 }
+    $w = 0
+    foreach ($c in $Text.ToCharArray()) {
+        $cp = [int]$c
+        # Common double-width ranges: CJK, fullwidth, some symbols/emoji
+        if (($cp -ge 0x1100 -and $cp -le 0x115F) -or   # Hangul Jamo
+            ($cp -ge 0x2E80 -and $cp -le 0x303E) -or   # CJK Radicals
+            ($cp -ge 0x3040 -and $cp -le 0x33BF) -or   # Japanese/CJK
+            ($cp -ge 0x3400 -and $cp -le 0x4DBF) -or   # CJK Ext A
+            ($cp -ge 0x4E00 -and $cp -le 0x9FFF) -or   # CJK Unified
+            ($cp -ge 0xA000 -and $cp -le 0xA4CF) -or   # Yi
+            ($cp -ge 0xAC00 -and $cp -le 0xD7AF) -or   # Hangul
+            ($cp -ge 0xF900 -and $cp -le 0xFAFF) -or   # CJK Compat
+            ($cp -ge 0xFE30 -and $cp -le 0xFE6F) -or   # CJK Compat Forms
+            ($cp -ge 0xFF01 -and $cp -le 0xFF60) -or   # Fullwidth
+            ($cp -ge 0xFFE0 -and $cp -le 0xFFE6) -or   # Fullwidth signs
+            ($cp -ge 0x2B50 -and $cp -le 0x2B55) -or   # Emoji stars/circles
+            ($cp -ge 0x1F300 -and $cp -le 0x1F9FF) -or # Emoji block
+            ($cp -ge 0xFE00 -and $cp -le 0xFE0F)) {    # Variation selectors
+            $w += 2
+        }
+        else {
+            $w += 1
+        }
+    }
+    return $w
+}
+
+# ── Pad or truncate string to exact display width ───────────────────
+function Format-FixedWidth {
+    param([string]$Text, [int]$Width)
+    $dw = Get-DisplayWidth -Text $Text
+    if ($dw -gt $Width) {
+        # Truncate: remove chars from end until display width fits
+        $result = ""
+        $currentWidth = 0
+        foreach ($c in $Text.ToCharArray()) {
+            $cp = [int]$c
+            $cw = 1
+            if (($cp -ge 0x1100 -and $cp -le 0x115F) -or
+                ($cp -ge 0x2E80 -and $cp -le 0x303E) -or
+                ($cp -ge 0x3040 -and $cp -le 0x33BF) -or
+                ($cp -ge 0x3400 -and $cp -le 0x4DBF) -or
+                ($cp -ge 0x4E00 -and $cp -le 0x9FFF) -or
+                ($cp -ge 0xA000 -and $cp -le 0xA4CF) -or
+                ($cp -ge 0xAC00 -and $cp -le 0xD7AF) -or
+                ($cp -ge 0xF900 -and $cp -le 0xFAFF) -or
+                ($cp -ge 0xFE30 -and $cp -le 0xFE6F) -or
+                ($cp -ge 0xFF01 -and $cp -le 0xFF60) -or
+                ($cp -ge 0xFFE0 -and $cp -le 0xFFE6) -or
+                ($cp -ge 0x2600 -and $cp -le 0x27BF) -or
+                ($cp -ge 0x2B50 -and $cp -le 0x2B55) -or
+                ($cp -ge 0xFE00 -and $cp -le 0xFE0F)) {
+                $cw = 2
+            }
+            if (($currentWidth + $cw) -gt ($Width - 3)) {
+                $result += "..."
+                break
+            }
+            $result += $c
+            $currentWidth += $cw
+        }
+        return $result + (" " * [Math]::Max(0, $Width - (Get-DisplayWidth -Text $result)))
+    }
+    else {
+        return $Text + (" " * [Math]::Max(0, $Width - $dw))
+    }
+}
+
+# ── Word-wrap text to fit within a given width ─────────────────────
+function Wrap-Text {
+    param([string]$Text, [int]$MaxWidth, [string]$Prefix = "")
+    $result = [System.Collections.ArrayList]::new()
+    if (-not $Text) { [void]$result.Add($Prefix); return $result }
+    $usable = $MaxWidth - $Prefix.Length
+    if ($usable -lt 10) { $usable = 10 }
+    foreach ($rawLine in ($Text -split "`n")) {
+        $line = $rawLine.TrimEnd()
+        if ($line.Length -eq 0) {
+            [void]$result.Add($Prefix)
+            continue
+        }
+        while ($line.Length -gt $usable) {
+            # Find last space within usable width
+            $breakAt = $line.LastIndexOf(' ', [Math]::Min($usable, $line.Length - 1))
+            if ($breakAt -le 0) { $breakAt = $usable }
+            [void]$result.Add($Prefix + $line.Substring(0, $breakAt).TrimEnd())
+            $line = $line.Substring($breakAt).TrimStart()
+        }
+        if ($line.Length -gt 0) {
+            [void]$result.Add($Prefix + $line)
+        }
+    }
+    return $result
+}
+
+# ── Render the main list ────────────────────────────────────────────
+function Render-WorkItemList {
+    param(
+        [System.Collections.ArrayList]$Items,
+        [int]$SelectedIndex,
+        [int]$ScrollOffset,
+        [string]$StatusMessage = "",
+        [hashtable]$ActiveTimers = @{}
+    )
+
+    [Console]::CursorVisible = $false
+    [Console]::SetCursorPosition(0, 0)
+
+    $width = [Console]::WindowWidth
+    $height = [Console]::WindowHeight
+
+    # Header
+    $header = " AZURE DEVOPS TIME TRACKER "
+    $padLen = [Math]::Max(0, $width - $header.Length)
+    Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkBlue
+
+    $helpLine = " [Arrows] Navigate  [Enter] Info  [t] Timer  [r] Refresh  [m] Tools  [q] Quit "
+    $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
+    Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
+
+    # Available lines for items
+    $availableLines = $height - 4  # header (1) + help (1) + status (1) + bottom margin (1)
+
+    if ($Items.Count -eq 0) {
+        Write-Host ""
+        Write-Host "  No work items found assigned to you." -ForegroundColor Yellow
+        Write-Host "  Press 'r' to refresh or 'q' to quit." -ForegroundColor Gray
+        $remaining = $availableLines - 2
+        for ($l = 0; $l -lt $remaining; $l++) {
+            Write-Host (" " * $width)
+        }
+    }
+    else {
+        # Filter out any items missing Id or Title
+        $validItems = $Items | Where-Object { $_.Id -and $_.Title }
+        # Adjust scroll offset so selected item is visible and valid
+        if ($SelectedIndex -lt $ScrollOffset) {
+            $ScrollOffset = $SelectedIndex
+        }
+        if ($SelectedIndex -ge ($ScrollOffset + $availableLines)) {
+            $ScrollOffset = $SelectedIndex - $availableLines + 1
+        }
+
+        $rendered = 0
+        for ($line = 0; $line -lt $availableLines; $line++) {
+            $idx = $ScrollOffset + $line
+            if ($idx -lt $validItems.Count) {
+                $item = $validItems[$idx]
+                $indent = "  " * $item.Depth
+                $icon = Get-TypeIcon -Type $item.Type
+                $typeColor = Get-TypeColor -Type $item.Type
+
+                # Active timer indicator
+                $timerStr = ""
+                $itemId = $item.Id
+                $isTracking = $ActiveTimers.ContainsKey($itemId)
+                if ($isTracking) {
+                    $sw = $ActiveTimers[$itemId]
+                    $timerStr = " [$(Format-Elapsed -SW $sw)]"
+                }
+
+                # Time info (completed/remaining)
+                $timeStr = ""
+                if ($null -ne $item.RemainingWork -or $null -ne $item.CompletedWork) {
+                    $cw = if ($null -ne $item.CompletedWork) { "{0:N1}h" -f [double]$item.CompletedWork } else { "-" }
+                    $rw = if ($null -ne $item.RemainingWork) { "{0:N1}h" -f [double]$item.RemainingWork } else { "-" }
+                    $timeStr = " [$cw/$rw]"
+                }
+
+                $stateStr = " ($($item.State))"
+
+                $prefix = "  "
+                if ($idx -eq $SelectedIndex) {
+                    $prefix = "> "
+                }
+
+                $lineText = "$prefix$indent$icon $($item.Id): $($item.Title)$stateStr$timeStr$timerStr"
+
+                $padded = Format-FixedWidth -Text $lineText -Width $width
+
+                if ($isTracking) {
+                    if ($idx -eq $SelectedIndex) {
+                        Write-Host $padded -ForegroundColor White -BackgroundColor DarkYellow
+                    }
+                    else {
+                        Write-Host $padded -ForegroundColor DarkYellow
+                    }
+                }
+                elseif ($idx -eq $SelectedIndex) {
+                    Write-Host $padded -ForegroundColor White -BackgroundColor DarkCyan
+                }
+                elseif (-not $item.IsMine) {
+                    Write-Host $padded -ForegroundColor DarkGray
+                }
+                else {
+                    Write-Host $padded -ForegroundColor $typeColor
+                }
+                $rendered++
+            }
+            else {
+                Write-Host (" " * $width)
+            }
+        }
+    }
+
+    # Status bar
+    $timerCount = $ActiveTimers.Count
+    $timerInfo = if ($timerCount -gt 0) { " | $timerCount timer(s) active" } else { "" }
+
+    if ($StatusMessage) {
+        $statusText = " $StatusMessage$timerInfo"
+        $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
+        Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkGreen
+    }
+    else {
+        $countMsg = " $($Items.Count) items$timerInfo"
+        $statusPadded = $countMsg + (" " * [Math]::Max(0, $width - $countMsg.Length))
+        if ($timerCount -gt 0) {
+            Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkRed
+        }
+        else {
+            Write-Host $statusPadded -ForegroundColor Gray -BackgroundColor DarkGray
+        }
+    }
+
+    return $ScrollOffset
+}
+
+# ── Render the Tools menu ───────────────────────────────────────────
+function Render-ToolsMenu {
+    param(
+        [int]$SelectedIndex,
+        [array]$MenuItems
+    )
+
+    [Console]::CursorVisible = $false
+    [Console]::SetCursorPosition(0, 0)
+
+    $width = [Console]::WindowWidth
+    $height = [Console]::WindowHeight
+
+    # Header
+    $header = " TOOLS "
+    $padLen = [Math]::Max(0, $width - $header.Length)
+    Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkBlue
+
+    $helpLine = " [Arrows] Navigate  [Enter] Select  [ESC] Back "
+    $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
+    Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
+
+    Write-Host ""
+
+    for ($i = 0; $i -lt $MenuItems.Count; $i++) {
+        $prefix = "  "
+        if ($i -eq $SelectedIndex) { $prefix = "> " }
+        $lineText = "$prefix$($MenuItems[$i].Label)"
+        $padded = Format-FixedWidth -Text $lineText -Width $width
+        if ($i -eq $SelectedIndex) {
+            Write-Host $padded -ForegroundColor White -BackgroundColor DarkCyan
+        }
+        else {
+            Write-Host $padded -ForegroundColor White
+        }
+    }
+
+    # Fill remaining lines
+    $usedLines = 3 + $MenuItems.Count  # header + help + blank + items
+    $remaining = $height - $usedLines - 1
+    for ($l = 0; $l -lt $remaining; $l++) {
+        Write-Host (" " * $width)
+    }
+
+    # Status bar
+    $statusText = " Select an option "
+    $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
+    Write-Host $statusPadded -ForegroundColor Gray -BackgroundColor DarkGray
+}
+
+# ── Render info/detail page ─────────────────────────────────────────
+function Render-DetailView {
+    param(
+        [hashtable]$Item,
+        [string]$Description,
+        [string]$ReproSteps = "",
+        [string]$SystemInfo = "",
+        [array]$Comments,
+        [int]$ScrollOffset,
+        [string]$Organization = "",
+        [string]$Project = ""
+    )
+
+    [Console]::CursorVisible = $false
+    [Console]::SetCursorPosition(0, 0)
+
+    $width = [Console]::WindowWidth
+    $height = [Console]::WindowHeight
+
+    # Build content lines
+    $lines = [System.Collections.ArrayList]::new()
+
+    [void]$lines.Add("")
+    [void]$lines.Add("  === $($Item.Type) #$($Item.Id): $($Item.Title) ===")
+    [void]$lines.Add("")
+    if ($Organization -and $Project) {
+        $adoUrl = "https://dev.azure.com/$Organization/$([Uri]::EscapeDataString($Project))/_workitems/edit/$($Item.Id)"
+        [void]$lines.Add("  URL:   $adoUrl")
+    }
+    [void]$lines.Add("  State: $($Item.State)")
+
+    if ($null -ne $Item.OriginalEstimate) {
+        [void]$lines.Add("  Original Estimate: $($Item.OriginalEstimate) hours")
+    }
+    if ($null -ne $Item.CompletedWork) {
+        [void]$lines.Add("  Completed Work:    $($Item.CompletedWork) hours")
+    }
+    if ($null -ne $Item.RemainingWork) {
+        [void]$lines.Add("  Remaining Work:    $($Item.RemainingWork) hours")
+    }
+
+    [void]$lines.Add("")
+    [void]$lines.Add("  --- Description ---")
+
+    $descPlain = Remove-Html -Html $Description
+    if ($descPlain) {
+        $wrappedDesc = Wrap-Text -Text $descPlain -MaxWidth $width -Prefix "  "
+        foreach ($wl in $wrappedDesc) { [void]$lines.Add($wl) }
+    }
+    else {
+        [void]$lines.Add("  (no description)")
+    }
+
+    if ($ReproSteps) {
+        [void]$lines.Add("")
+        [void]$lines.Add("  --- Repro Steps ---")
+        $reproPlain = Remove-Html -Html $ReproSteps
+        $wrappedRepro = Wrap-Text -Text $reproPlain -MaxWidth $width -Prefix "  "
+        foreach ($wl in $wrappedRepro) { [void]$lines.Add($wl) }
+    }
+
+    if ($SystemInfo) {
+        [void]$lines.Add("")
+        [void]$lines.Add("  --- System Info ---")
+        $sysPlain = Remove-Html -Html $SystemInfo
+        $wrappedSys = Wrap-Text -Text $sysPlain -MaxWidth $width -Prefix "  "
+        foreach ($wl in $wrappedSys) { [void]$lines.Add($wl) }
+    }
+
+    [void]$lines.Add("")
+    [void]$lines.Add("  --- Comments ($($Comments.Count)) ---")
+
+    if ($Comments.Count -eq 0) {
+        [void]$lines.Add("  (no comments)")
+    }
+    else {
+        foreach ($comment in $Comments) {
+            [void]$lines.Add("")
+            $author = "Unknown"
+            if ($comment.createdBy -and $comment.createdBy.displayName) {
+                $author = $comment.createdBy.displayName
+            }
+            $date = ""
+            if ($comment.createdDate) {
+                $date = ([datetime]$comment.createdDate).ToString("yyyy-MM-dd HH:mm")
+            }
+            [void]$lines.Add("  [$date] ${author}:")
+            $commentText = Remove-Html -Html $comment.text
+            $wrappedComment = Wrap-Text -Text $commentText -MaxWidth $width -Prefix "    "
+            foreach ($wl in $wrappedComment) { [void]$lines.Add($wl) }
+        }
+    }
+
+    # Header
+    $header = " WORK ITEM DETAILS "
+    $padLen = [Math]::Max(0, $width - $header.Length)
+    Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkBlue
+
+    $helpLine = " [ESC] Back  [Arrows] Scroll  [s] Status  [h] Hours  [f] Edit Fields  [a] Add Comment  [e] Edit  [d] Delete "
+    $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
+    Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
+
+    $availableLines = $height - 3
+
+    for ($l = 0; $l -lt $availableLines; $l++) {
+        $lineIdx = $ScrollOffset + $l
+        if ($lineIdx -lt $lines.Count) {
+            $lineText = $lines[$lineIdx]
+            $padded = Format-FixedWidth -Text $lineText -Width $width
+            Write-Host $padded -ForegroundColor White
+        }
+        else {
+            Write-Host (" " * $width)
+        }
+    }
+
+    # Status
+    $scrollInfo = " Line $($ScrollOffset + 1) of $($lines.Count) "
+    $padded3 = $scrollInfo + (" " * [Math]::Max(0, $width - $scrollInfo.Length))
+    Write-Host $padded3 -ForegroundColor Gray -BackgroundColor DarkGray
+
+    return @{
+        ScrollOffset = $ScrollOffset
+        TotalLines   = $lines.Count
+    }
+}
+
+# ── Multi-line text editor ──────────────────────────────────────────
+function Edit-TextBlock {
+    <#
+    .SYNOPSIS
+        A simple full-screen multi-line text editor.
+        Returns the edited text as a single string with newline line breaks,
+        or $null if the user pressed Ctrl+Q to cancel.
+    #>
+    param(
+        [string]$Title = "Edit Comment",
+        [string]$InitialText = ""
+    )
+
+    [Console]::CursorVisible = $true
+    [Console]::Clear()
+
+    $width  = [Console]::WindowWidth
+    $height = [Console]::WindowHeight
+
+    # Split initial text into editable line buffers
+    $lines = [System.Collections.ArrayList]::new()
+    $rawLines = @($InitialText -split "`n")
+    foreach ($rl in $rawLines) {
+        [void]$lines.Add([System.Collections.ArrayList]::new([char[]]$rl.TrimEnd()))
+    }
+    if ($lines.Count -eq 0) {
+        [void]$lines.Add([System.Collections.ArrayList]::new())
+    }
+
+    $cursorRow = 0
+    $cursorCol = $lines[0].Count   # start at end of first line
+    $scrollRow = 0
+
+    $headerLines = 2   # header + help bar
+    $footerLines = 1   # status bar
+    $editHeight  = $height - $headerLines - $footerLines
+
+    function Redraw {
+        [Console]::SetCursorPosition(0, 0)
+
+        # Header
+        $hdr = " $Title "
+        $padH = [Math]::Max(0, $width - $hdr.Length)
+        Write-Host ($hdr + (" " * $padH)) -ForegroundColor White -BackgroundColor DarkBlue
+
+        $help = " [Ctrl+S] Save  [Ctrl+Q] Cancel  [Enter] New Line  [Arrows] Move "
+        $padHelp = [Math]::Max(0, $width - $help.Length)
+        Write-Host ($help + (" " * $padHelp)) -ForegroundColor Gray -BackgroundColor DarkGray
+
+        for ($row = 0; $row -lt $editHeight; $row++) {
+            $lineIdx = $scrollRow + $row
+            if ($lineIdx -lt $lines.Count) {
+                $lineText = ($lines[$lineIdx] -join "")
+                if ($lineText.Length -gt ($width - 1)) {
+                    $lineText = $lineText.Substring(0, $width - 1)
+                }
+                $padded = $lineText + (" " * [Math]::Max(0, $width - $lineText.Length))
+            }
+            else {
+                $padded = "~" + (" " * [Math]::Max(0, $width - 1))
+            }
+            Write-Host $padded -ForegroundColor White -NoNewline
+            # move to next line without scrolling
+            if ($row -lt $editHeight - 1) { Write-Host "" }
+        }
+
+        # Footer
+        [Console]::SetCursorPosition(0, $height - 1)
+        $lineInfo = " Line $($cursorRow + 1)/$($lines.Count)  Col $($cursorCol + 1) "
+        $padF = [Math]::Max(0, $width - $lineInfo.Length)
+        Write-Host ($lineInfo + (" " * $padF)) -ForegroundColor Gray -BackgroundColor DarkGray -NoNewline
+
+        # Position real cursor
+        $screenRow = $headerLines + ($cursorRow - $scrollRow)
+        $screenCol = [Math]::Min($cursorCol, $width - 1)
+        [Console]::SetCursorPosition($screenCol, $screenRow)
+    }
+
+    while ($true) {
+        # Ensure cursor is within bounds
+        if ($cursorRow -lt 0) { $cursorRow = 0 }
+        if ($cursorRow -ge $lines.Count) { $cursorRow = $lines.Count - 1 }
+        $lineLen = $lines[$cursorRow].Count
+        if ($cursorCol -gt $lineLen) { $cursorCol = $lineLen }
+        if ($cursorCol -lt 0) { $cursorCol = 0 }
+
+        # Scroll to keep cursor visible
+        if ($cursorRow -lt $scrollRow) { $scrollRow = $cursorRow }
+        if ($cursorRow -ge $scrollRow + $editHeight) { $scrollRow = $cursorRow - $editHeight + 1 }
+
+        Redraw
+
+        $key = [Console]::ReadKey($true)
+
+        # Ctrl+S = save
+        if ($key.Key -eq 'S' -and ($key.Modifiers -band [ConsoleModifiers]::Control)) {
+            $result = [System.Collections.ArrayList]::new()
+            foreach ($line in $lines) {
+                [void]$result.Add(($line -join ""))
+            }
+            [Console]::CursorVisible = $false
+            return ($result -join "`n")
+        }
+        # Ctrl+Q = cancel
+        if ($key.Key -eq 'Q' -and ($key.Modifiers -band [ConsoleModifiers]::Control)) {
+            [Console]::CursorVisible = $false
+            return $null
+        }
+
+        switch ($key.Key) {
+            'UpArrow' {
+                if ($cursorRow -gt 0) { $cursorRow-- }
+            }
+            'DownArrow' {
+                if ($cursorRow -lt ($lines.Count - 1)) { $cursorRow++ }
+            }
+            'LeftArrow' {
+                if ($cursorCol -gt 0) {
+                    $cursorCol--
+                }
+                elseif ($cursorRow -gt 0) {
+                    $cursorRow--
+                    $cursorCol = $lines[$cursorRow].Count
+                }
+            }
+            'RightArrow' {
+                if ($cursorCol -lt $lines[$cursorRow].Count) {
+                    $cursorCol++
+                }
+                elseif ($cursorRow -lt ($lines.Count - 1)) {
+                    $cursorRow++
+                    $cursorCol = 0
+                }
+            }
+            'Home' {
+                $cursorCol = 0
+            }
+            'End' {
+                $cursorCol = $lines[$cursorRow].Count
+            }
+            'Enter' {
+                # Split current line at cursor
+                $tail = [System.Collections.ArrayList]::new()
+                if ($cursorCol -lt $lines[$cursorRow].Count) {
+                    for ($i = $cursorCol; $i -lt $lines[$cursorRow].Count; $i++) {
+                        [void]$tail.Add($lines[$cursorRow][$i])
+                    }
+                    $lines[$cursorRow].RemoveRange($cursorCol, $lines[$cursorRow].Count - $cursorCol)
+                }
+                $cursorRow++
+                $lines.Insert($cursorRow, $tail)
+                $cursorCol = 0
+            }
+            'Backspace' {
+                if ($cursorCol -gt 0) {
+                    $lines[$cursorRow].RemoveAt($cursorCol - 1)
+                    $cursorCol--
+                }
+                elseif ($cursorRow -gt 0) {
+                    # Merge with previous line
+                    $prevLen = $lines[$cursorRow - 1].Count
+                    foreach ($ch in $lines[$cursorRow]) {
+                        [void]$lines[$cursorRow - 1].Add($ch)
+                    }
+                    $lines.RemoveAt($cursorRow)
+                    $cursorRow--
+                    $cursorCol = $prevLen
+                }
+            }
+            'Delete' {
+                if ($cursorCol -lt $lines[$cursorRow].Count) {
+                    $lines[$cursorRow].RemoveAt($cursorCol)
+                }
+                elseif ($cursorRow -lt ($lines.Count - 1)) {
+                    # Merge next line into current
+                    foreach ($ch in $lines[$cursorRow + 1]) {
+                        [void]$lines[$cursorRow].Add($ch)
+                    }
+                    $lines.RemoveAt($cursorRow + 1)
+                }
+            }
+            default {
+                if ($key.KeyChar -ne "`0" -and -not [char]::IsControl($key.KeyChar)) {
+                    $lines[$cursorRow].Insert($cursorCol, $key.KeyChar)
+                    $cursorCol++
+                }
+            }
+        }
+    }
+}
+
+# ── Render comment picker (arrow-navigated) ───────────────────────
+function Render-CommentPicker {
+    param(
+        [hashtable]$Item,
+        [array]$Comments,
+        [int]$SelectedIndex,
+        [string]$Action   # "edit" or "delete"
+    )
+
+    [Console]::CursorVisible = $false
+    [Console]::SetCursorPosition(0, 0)
+
+    $width  = [Console]::WindowWidth
+    $height = [Console]::WindowHeight
+
+    $actionLabel = if ($Action -eq "edit") { "EDIT" } else { "DELETE" }
+
+    # Header
+    $header = " SELECT COMMENT TO $actionLabel "
+    $padLen = [Math]::Max(0, $width - $header.Length)
+    Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkMagenta
+
+    $helpLine = " [Up/Down] Select  [Enter] Confirm  [ESC] Cancel "
+    $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
+    Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
+
+    $availableLines = $height - 3
+
+    # Map each comment to the range of content-line indices it occupies
+    $contentLines  = [System.Collections.ArrayList]::new()
+    $commentFirstLine = @{}   # commentIndex -> first contentLine index
+
+    [void]$contentLines.Add("")
+    [void]$contentLines.Add("  $($Item.Type) #$($Item.Id): $($Item.Title)")
+    [void]$contentLines.Add("")
+
+    for ($ci = 0; $ci -lt $Comments.Count; $ci++) {
+        $c = $Comments[$ci]
+        $author = "Unknown"
+        if ($c.createdBy -and $c.createdBy.displayName) { $author = $c.createdBy.displayName }
+        $date = ""
+        if ($c.createdDate) { $date = ([datetime]$c.createdDate).ToString("yyyy-MM-dd HH:mm") }
+
+        $prefix = if ($ci -eq $SelectedIndex) { " >" } else { "  " }
+
+        $commentFirstLine[$ci] = $contentLines.Count
+        [void]$contentLines.Add("$prefix [$date] ${author}:")
+
+        # Show ALL lines of the comment text, not just one preview line
+        $commentPlain = Remove-Html -Html $c.text
+        $textLines = @($commentPlain -split "`n")
+        foreach ($tl in $textLines) {
+            $tlTrimmed = $tl.TrimEnd()
+            if ($tlTrimmed.Length -gt ($width - 8)) {
+                $tlTrimmed = $tlTrimmed.Substring(0, [Math]::Max(0, $width - 11)) + "..."
+            }
+            [void]$contentLines.Add("$prefix   $tlTrimmed")
+        }
+        [void]$contentLines.Add("")
+    }
+
+    # Scroll so the selected comment is visible
+    $scrollOffset = 0
+    if ($SelectedIndex -ge 0 -and $commentFirstLine.ContainsKey($SelectedIndex)) {
+        $selStart = $commentFirstLine[$SelectedIndex]
+        if ($selStart -ge $availableLines) {
+            $scrollOffset = $selStart - 2   # show a bit of context above
+            $scrollOffset = [Math]::Max(0, $scrollOffset)
+        }
+    }
+
+    # Build highlight set for the selected comment's lines
+    $highlightSet = [System.Collections.Generic.HashSet[int]]::new()
+    if ($SelectedIndex -ge 0 -and $commentFirstLine.ContainsKey($SelectedIndex)) {
+        $hlStart = $commentFirstLine[$SelectedIndex]
+        # Highlight until the next blank separator line (exclusive)
+        $hlEnd = if ($commentFirstLine.ContainsKey($SelectedIndex + 1)) {
+            $commentFirstLine[$SelectedIndex + 1] - 1   # blank line before next comment
+        } else {
+            $contentLines.Count - 1
+        }
+        for ($h = $hlStart; $h -le $hlEnd; $h++) {
+            [void]$highlightSet.Add($h)
+        }
+    }
+
+    for ($l = 0; $l -lt $availableLines; $l++) {
+        $ci2 = $scrollOffset + $l
+        if ($ci2 -lt $contentLines.Count) {
+            $lineText = $contentLines[$ci2]
+            if ($lineText.Length -gt $width) { $lineText = $lineText.Substring(0, $width - 3) + "..." }
+            $padded = $lineText + (" " * [Math]::Max(0, $width - $lineText.Length))
+            if ($highlightSet.Contains($ci2)) {
+                Write-Host $padded -ForegroundColor White -BackgroundColor DarkCyan
+            }
+            else {
+                Write-Host $padded -ForegroundColor White
+            }
+        }
+        else {
+            Write-Host (" " * $width)
+        }
+    }
+
+    $statusLine = " Comment $($SelectedIndex + 1) of $($Comments.Count) "
+    $padded3 = $statusLine + (" " * [Math]::Max(0, $width - $statusLine.Length))
+    Write-Host $padded3 -ForegroundColor Gray -BackgroundColor DarkGray -NoNewline
+}
+
+# ── Render field picker ───────────────────────────────────────────
+function Render-FieldPicker {
+    param(
+        [hashtable]$Item,
+        [array]$Fields,
+        [int]$SelectedIndex
+    )
+
+    [Console]::CursorVisible = $false
+    [Console]::SetCursorPosition(0, 0)
+
+    $width  = [Console]::WindowWidth
+    $height = [Console]::WindowHeight
+
+    # Header
+    $header = " EDIT FIELD "
+    $padLen = [Math]::Max(0, $width - $header.Length)
+    Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkMagenta
+
+    $helpLine = " [Up/Down] Select  [Enter] Edit  [ESC] Cancel "
+    $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
+    Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
+
+    $availableLines = $height - 3
+
+    $contentLines = [System.Collections.ArrayList]::new()
+    [void]$contentLines.Add("")
+    [void]$contentLines.Add("  $($Item.Type) #$($Item.Id): $($Item.Title)")
+    [void]$contentLines.Add("")
+    [void]$contentLines.Add("  Select a field to edit:")
+    [void]$contentLines.Add("")
+
+    $fieldStartLine = $contentLines.Count
+
+    for ($i = 0; $i -lt $Fields.Count; $i++) {
+        $prefix = if ($i -eq $SelectedIndex) { "  > " } else { "    " }
+        $f = $Fields[$i]
+        $preview = $f.Preview
+        if ($preview.Length -gt ($width - 30)) {
+            $preview = $preview.Substring(0, [Math]::Max(0, $width - 33)) + "..."
+        }
+        [void]$contentLines.Add("$prefix$($f.Label):  $preview")
+    }
+
+    for ($l = 0; $l -lt $availableLines; $l++) {
+        if ($l -lt $contentLines.Count) {
+            $lineText = $contentLines[$l]
+            $padded = $lineText + (" " * [Math]::Max(0, $width - $lineText.Length))
+            if ($l -ge $fieldStartLine -and ($l - $fieldStartLine) -eq $SelectedIndex) {
+                Write-Host $padded -ForegroundColor White -BackgroundColor DarkCyan
+            }
+            else {
+                Write-Host $padded -ForegroundColor White
+            }
+        }
+        else {
+            Write-Host (" " * $width)
+        }
+    }
+
+    $statusLine = " Choose a field "
+    $padded3 = $statusLine + (" " * [Math]::Max(0, $width - $statusLine.Length))
+    Write-Host $padded3 -ForegroundColor Gray -BackgroundColor DarkGray -NoNewline
+}
+
+# ── Render status picker ───────────────────────────────────────────
+function Render-StatusPicker {
+    param(
+        [hashtable]$Item,
+        [array]$Statuses,
+        [int]$SelectedStatusIndex
+    )
+
+    [Console]::CursorVisible = $false
+    [Console]::SetCursorPosition(0, 0)
+
+    $width = [Console]::WindowWidth
+    $height = [Console]::WindowHeight
+
+    # Header
+    $header = " CHANGE STATUS "
+    $padLen = [Math]::Max(0, $width - $header.Length)
+    Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkMagenta
+
+    $helpLine = " [Up/Down] Select  [Enter] Confirm  [ESC] Cancel "
+    $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
+    Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
+
+    $availableLines = $height - 3
+
+    $contentLines = [System.Collections.ArrayList]::new()
+    [void]$contentLines.Add("")
+    [void]$contentLines.Add("  $($Item.Type) #$($Item.Id): $($Item.Title)")
+    [void]$contentLines.Add("  Current State: $($Item.State)")
+    [void]$contentLines.Add("")
+    [void]$contentLines.Add("  Select new status:")
+    [void]$contentLines.Add("")
+
+    $statusStartLine = $contentLines.Count
+
+    for ($i = 0; $i -lt $Statuses.Count; $i++) {
+        $prefix = "    "
+        if ($i -eq $SelectedStatusIndex) {
+            $prefix = "  > "
+        }
+        [void]$contentLines.Add("$prefix$($Statuses[$i])")
+    }
+
+    for ($l = 0; $l -lt $availableLines; $l++) {
+        if ($l -lt $contentLines.Count) {
+            $lineText = $contentLines[$l]
+            $padded = $lineText + (" " * [Math]::Max(0, $width - $lineText.Length))
+            if ($l -ge $statusStartLine -and ($l - $statusStartLine) -eq $SelectedStatusIndex) {
+                Write-Host $padded -ForegroundColor White -BackgroundColor DarkCyan
+            }
+            else {
+                Write-Host $padded -ForegroundColor White
+            }
+        }
+        else {
+            Write-Host (" " * $width)
+        }
+    }
+
+    $statusLine = " Choose a status "
+    $padded3 = $statusLine + (" " * [Math]::Max(0, $width - $statusLine.Length))
+    Write-Host $padded3 -ForegroundColor Gray -BackgroundColor DarkGray
+}
