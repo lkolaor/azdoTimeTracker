@@ -101,29 +101,33 @@ function Start-TimeTracker {
             -Project $Config.Project -PAT $Config.PAT `
             -WorkItemId $Item.Id
 
-        $currentCompleted = 0.0
-        $currentRemaining = 0.0
+        $currentCompleted    = 0.0
+        $currentRemaining    = 0.0
+        $originalEstimate    = $null
         if ($null -ne $freshItem) {
             $fields = $freshItem.fields
             if ($null -ne $fields) {
                 $cwProp = $fields.PSObject.Properties['Microsoft.VSTS.Scheduling.CompletedWork']
-                if ($null -ne $cwProp) {
-                    if ($null -ne $cwProp.Value) { $currentCompleted = [double]$cwProp.Value }
-                }
+                if ($null -ne $cwProp -and $null -ne $cwProp.Value) { $currentCompleted = [double]$cwProp.Value }
                 $rwProp = $fields.PSObject.Properties['Microsoft.VSTS.Scheduling.RemainingWork']
-                if ($null -ne $rwProp) {
-                    if ($null -ne $rwProp.Value) { $currentRemaining = [double]$rwProp.Value }
-                }
+                if ($null -ne $rwProp -and $null -ne $rwProp.Value) { $currentRemaining = [double]$rwProp.Value }
+                $oeProp = $fields.PSObject.Properties['Microsoft.VSTS.Scheduling.OriginalEstimate']
+                if ($null -ne $oeProp -and $null -ne $oeProp.Value) { $originalEstimate = [double]$oeProp.Value }
             }
         }
 
-        Write-TTDebugLog "Save-Timer: WI=$($Item.Id) elapsed=${elapsedHours}h fresh_C=$currentCompleted fresh_R=$currentRemaining"
+        Write-TTDebugLog "Save-Timer: WI=$($Item.Id) elapsed=${elapsedHours}h fresh_C=$currentCompleted fresh_R=$currentRemaining OE=$originalEstimate"
 
-        [double]$newCompleted = [double]$currentCompleted + [double]$elapsedHours
-        [double]$newRemaining = [double]$currentRemaining - [double]$elapsedHours
+        [double]$newCompleted = $currentCompleted + $elapsedHours
+        # Remaining = OriginalEstimate - newCompleted; fall back to currentRemaining - elapsed if no estimate
+        [double]$newRemaining = if ($null -ne $originalEstimate) {
+            $originalEstimate - $newCompleted
+        } else {
+            $currentRemaining - $elapsedHours
+        }
         if ($newRemaining -lt 0) { $newRemaining = 0.0 }
 
-        Write-TTDebugLog "Save-Timer: newCompleted=$newCompleted newRemaining=$newRemaining"
+        Write-TTDebugLog "Save-Timer: newCompleted=$newCompleted newRemaining=$newRemaining (OE-based=$($null -ne $originalEstimate))"
 
         try {
             $apiResult = Update-WorkItemTime -Organization $Config.Organization `
@@ -148,7 +152,8 @@ function Start-TimeTracker {
             $Item['CompletedWork'] = $actualC
             $Item['RemainingWork'] = $actualR
 
-            return "Saved ${elapsedHours}h to #$($Item.Id) C:$currentCompleted->$actualC R:$currentRemaining->$actualR"
+            $oeStr = if ($null -ne $originalEstimate) { "OE:${originalEstimate}h" } else { "OE:none" }
+            return "Saved ${elapsedHours}h to #$($Item.Id) C:$currentCompleted->$actualC R:$currentRemaining->$actualR $oeStr"
         }
         catch {
             return "Error saving #$($Item.Id): $($_.Exception.Message)"

@@ -143,10 +143,23 @@ Press `m` from the list view to open the Tools menu. Available options:
 2. Press `t` to start the timer
 3. Work on your task — the elapsed time is displayed live
 4. Press `t` again to stop the timer and save
-5. The elapsed time is added to **Completed Work** and subtracted from **Remaining Work**
-6. Changes are saved to Azure DevOps automatically
+5. The elapsed time is added to **Completed Work**
+6. **Remaining Work** is recalculated as `Original Estimate − Completed Work`
+7. Changes are saved to Azure DevOps automatically
 
 > Items without time tracking fields (e.g., Features, Epics) will show a message that time tracking is not supported.
+
+### How time is calculated on save
+
+When stopping a timer, the tracker always fetches the latest values from Azure DevOps before writing anything back, so concurrent edits are not overwritten.
+
+| Field | Formula |
+|-------|---------|
+| Completed Work | `current Completed Work + elapsed time` |
+| Remaining Work | `Original Estimate − new Completed Work` |
+
+If no **Original Estimate** is set on the item, Remaining Work falls back to `current Remaining Work − elapsed time` instead.
+Remaining Work is always clamped to a minimum of 0.
 
 ### Time Tracking on User Stories
 
