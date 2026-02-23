@@ -7,9 +7,11 @@ Please note that this whole thing is vibe coded, use at your own peril.
 
 - Displays all work items (Epics, Features, User Stories, Tasks, Bugs, Incidents) assigned to you
 - Hierarchical view showing parent-child relationships
+- Closed/Done child tasks remain visible in the list as long as their parent is still active
 - Keyboard-driven navigation
 - View work item details and comments inline
 - Built-in stopwatch for time tracking
+- Starting a timer on a closed item automatically reactivates it and resets Remaining Work
 - Automatically updates Completed Work and Remaining Work fields in Azure DevOps
 - Full-screen text editor for comments and field editing
 - Tools menu for reconfiguring settings
@@ -160,6 +162,23 @@ When stopping a timer, the tracker always fetches the latest values from Azure D
 
 If no **Original Estimate** is set on the item, Remaining Work falls back to `current Remaining Work − elapsed time` instead.
 Remaining Work is always clamped to a minimum of 0.
+
+### Closed Items
+
+Recently closed/done items assigned to you are still fetched and displayed in the list as long as their **parent work item is also assigned to you and not yet closed**. This covers the last 90 days of changes. Closed items are shown with their `(Closed)` / `(Done)` state in the list so they are visually distinct.
+
+### Starting a Timer on a Closed Item
+
+If you press `t` on a closed or done item, the tracker automatically:
+
+1. Fetches the available states for that work item type
+2. Transitions the item to the best matching active state (`Active`, `In Progress`, `Committed`, or `In Development` — whichever exists for that type)
+3. Resets **Remaining Work** to `max(0, Original Estimate − Completed Work)` so the remaining effort reflects what is still left to do
+4. Starts the timer
+
+The status bar shows a confirmation such as `Reactivated #1234 to 'Active' | Remaining set to 3.5h (OE:8h - C:4.5h) | Timer started`.
+
+If the item has no **Original Estimate**, step 3 is skipped and Remaining Work is left unchanged.
 
 ### Time Tracking on User Stories
 

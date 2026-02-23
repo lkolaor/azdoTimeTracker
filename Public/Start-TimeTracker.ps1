@@ -338,8 +338,68 @@ function Start-TimeTracker {
                                         $statusMessage = "Item #$itemId has no time tracking fields"
                                     }
                                     else {
+                                        # If the item is closed/done, reactivate it and reset remaining work
+                                        $closedStates = @('Closed', 'Done', 'Released', 'Removed')
+                                        if ($closedStates -contains $item.State) {
+                                            $reactivateMsg = ""
+                                            try {
+                                                # Pick the best active state for this work item type
+                                                $states = @(Get-WorkItemTypeStates -Organization $config.Organization `
+                                                    -Project $config.Project -PAT $config.PAT `
+                                                    -WorkItemType $item.Type)
+
+                                                $preferredActive = @('Active', 'In Progress', 'Committed', 'In Development')
+                                                $targetState = $null
+                                                foreach ($ps in $preferredActive) {
+                                                    if ($states -contains $ps) { $targetState = $ps; break }
+                                                }
+                                                if (-not $targetState) {
+                                                    # Fall back: first state that isn't in the closed set and isn't 'New'/'Proposed'
+                                                    $skipStates = $closedStates + @('New', 'Proposed', 'Removed')
+                                                    $targetState = $states | Where-Object { $skipStates -notcontains $_ } | Select-Object -First 1
+                                                }
+                                                if (-not $targetState -and $states.Count -gt 0) {
+                                                    $targetState = $states[0]
+                                                }
+
+                                                if ($targetState) {
+                                                    Update-WorkItemState -Organization $config.Organization `
+                                                        -Project $config.Project -PAT $config.PAT `
+                                                        -WorkItemId $itemId -NewState $targetState
+                                                    $item['State'] = $targetState
+                                                    $reactivateMsg = "Reactivated #$itemId to '$targetState'"
+                                                }
+                                            }
+                                            catch {
+                                                $reactivateMsg = "Warning: could not reactivate #$itemId ($($_.Exception.Message))"
+                                            }
+
+                                            # Reset remaining work = max(0, OriginalEstimate - CompletedWork)
+                                            try {
+                                                $oe = if ($null -ne $item.OriginalEstimate) { [double]$item.OriginalEstimate } else { $null }
+                                                $cw = if ($null -ne $item.CompletedWork)    { [double]$item.CompletedWork    } else { 0.0 }
+                                                if ($null -ne $oe) {
+                                                    $newRemaining = [Math]::Max(0.0, $oe - $cw)
+                                                    Update-WorkItemTime -Organization $config.Organization `
+                                                        -Project $config.Project -PAT $config.PAT `
+                                                        -WorkItemId $itemId `
+                                                        -CompletedWork $cw `
+                                                        -RemainingWork $newRemaining | Out-Null
+                                                    $item['RemainingWork'] = $newRemaining
+                                                    $reactivateMsg += " | Remaining set to $([Math]::Round($newRemaining,2))h (OE:${oe}h - C:${cw}h)"
+                                                }
+                                            }
+                                            catch {
+                                                $reactivateMsg += " | Warning: could not reset remaining work ($($_.Exception.Message))"
+                                            }
+
+                                            $statusMessage = "$reactivateMsg | Timer started"
+                                        }
+                                        else {
+                                            $statusMessage = "Started timer on #$itemId"
+                                        }
+
                                         $activeTimers[$itemId] = [System.Diagnostics.Stopwatch]::StartNew()
-                                        $statusMessage = "Started timer on #$itemId"
                                     }
                                 }
                             }

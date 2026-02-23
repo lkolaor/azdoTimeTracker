@@ -104,6 +104,61 @@ ORDER BY [System.WorkItemType], [System.Title]
         }
     }
 
+    # Collect active item IDs for parent-match check below
+    $myActiveIds = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($item in $allItems) {
+        [void]$myActiveIds.Add([int]$item.fields.'System.Id')
+    }
+
+    # Fetch closed/done items also assigned to me; keep only those whose parent
+    # is still in the active set so they remain visible under the parent.
+    $wiqlClosed = @{
+        query = @"
+SELECT [System.Id]
+FROM WorkItems
+WHERE [System.AssignedTo] = @me
+  AND ([System.State] = 'Closed'
+    OR [System.State] = 'Done'
+    OR [System.State] = 'Released')
+  AND [System.ChangedDate] >= @Today - 90
+ORDER BY [System.ChangedDate] DESC
+"@
+    } | ConvertTo-Json
+
+    try {
+        $closedResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers `
+            -ContentType "application/json" -Body $wiqlClosed -ErrorAction Stop
+
+        if ($closedResult.workItems -and $closedResult.workItems.Count -gt 0) {
+            $closedIds = $closedResult.workItems | ForEach-Object { $_.id }
+            # Exclude IDs already in $allItems
+            $closedIds = $closedIds | Where-Object { -not $myActiveIds.Contains([int]$_) }
+
+            if ($closedIds.Count -gt 0) {
+                for ($i = 0; $i -lt $closedIds.Count; $i += $batchSize) {
+                    $batchIds = $closedIds[$i .. [Math]::Min($i + $batchSize - 1, $closedIds.Count - 1)]
+                    $idsString = $batchIds -join ","
+                    $detailUrl = "$baseUrl/wit/workitems?ids=$idsString&fields=$fields&api-version=7.1"
+                    try {
+                        $details = Invoke-RestMethod -Uri $detailUrl -Method Get -Headers $headers -ErrorAction Stop
+                        foreach ($wi in $details.value) {
+                            $parentId = Get-SafeField -Fields $wi.fields -Name 'System.Parent'
+                            if ($parentId -and $myActiveIds.Contains([int]$parentId)) {
+                                $allItems += $wi
+                            }
+                        }
+                    }
+                    catch {
+                        # Silently ignore; closed items are best-effort
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        # Silently ignore; closed-child fetch is best-effort
+    }
+
     # Also fetch parent items that we don't own but need for hierarchy display
     $parentIds = @()
     foreach ($item in $allItems) {
