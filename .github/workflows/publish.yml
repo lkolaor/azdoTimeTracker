@@ -1,0 +1,36 @@
+name: Build and publish release
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build .nupkg
+        shell: pwsh
+        run: ./Build-Package.ps1 -OutputDir ./out
+
+      - name: Read version from manifest
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Import-PowerShellDataFile ./AzDoTimeTracker.psd1).ModuleVersion
+          echo "value=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.value }}
+          name: v${{ steps.version.outputs.value }}
+          files: out/*.nupkg
+          generate_release_notes: true
