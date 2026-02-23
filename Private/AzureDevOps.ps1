@@ -571,6 +571,87 @@ function Update-WorkItemState {
     }
 }
 
+# ── Create a child Task linked to a parent work item ─────────────
+function New-ChildTask {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT,
+        [int]$ParentId,
+        [string]$Title,
+        [string]$AssignedTo,
+        [double]$OriginalEstimate = 5,
+        [double]$RemainingWork = 5
+    )
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $url = "https://dev.azure.com/$Organization/$Project/_apis/wit/workitems/`$Task?api-version=7.1"
+
+    $patchOps = [System.Collections.ArrayList]::new()
+    [void]$patchOps.Add([ordered]@{
+        op    = "add"
+        path  = "/fields/System.Title"
+        value = $Title
+    })
+    if ($AssignedTo) {
+        [void]$patchOps.Add([ordered]@{
+            op    = "add"
+            path  = "/fields/System.AssignedTo"
+            value = $AssignedTo
+        })
+    }
+    [void]$patchOps.Add([ordered]@{
+        op    = "add"
+        path  = "/fields/Microsoft.VSTS.Scheduling.OriginalEstimate"
+        value = $OriginalEstimate
+    })
+    [void]$patchOps.Add([ordered]@{
+        op    = "add"
+        path  = "/fields/Microsoft.VSTS.Scheduling.RemainingWork"
+        value = $RemainingWork
+    })
+    [void]$patchOps.Add([ordered]@{
+        op    = "add"
+        path  = "/relations/-"
+        value = [ordered]@{
+            rel = "System.LinkTypes.Hierarchy-Reverse"
+            url = "https://dev.azure.com/$Organization/$Project/_apis/wit/workitems/$ParentId"
+        }
+    })
+
+    $body = ConvertTo-Json -InputObject @($patchOps) -Depth 10 -Compress
+    Write-TTDebugLog "New-ChildTask: Parent=$ParentId Title=$Title Body=$body"
+
+    try {
+        $result = Invoke-RestMethod -Uri $url -Method Patch -Headers $headers `
+            -ContentType "application/json-patch+json" `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ErrorAction Stop
+
+        # Set state to Active in a separate call (some processes reject it during creation)
+        try {
+            $null = Update-WorkItemState -Organization $Organization -Project $Project `
+                -PAT $PAT -WorkItemId $result.id -NewState "Active"
+        }
+        catch {
+            Write-TTDebugLog "New-ChildTask: Failed to set Active state: $($_.Exception.Message)"
+        }
+
+        return $result
+    }
+    catch {
+        $errDetail = $_.Exception.Message
+        try {
+            $stream = $_.Exception.Response.GetResponseStream()
+            $reader = [System.IO.StreamReader]::new($stream)
+            $respBody = $reader.ReadToEnd()
+            $reader.Close()
+            Write-TTDebugLog "New-ChildTask ERROR response: $respBody"
+            $errDetail = "$errDetail | $respBody"
+        } catch { }
+        throw "Error creating child task for work item ${ParentId}: $errDetail"
+    }
+}
+
 # ── Update a work item field ──────────────────────────────────────
 function Update-WorkItemField {
     param(

@@ -88,7 +88,7 @@ Start-TimeTracker -Reconfigure
 | `Page Up` / `Page Down` | Scroll by page |
 | `Home` / `End` | Jump to first/last item |
 | `Enter` | View item details (description + comments) |
-| `t` | Start/stop time tracking on selected item |
+| `t` | Start/stop time tracking on selected item (on User Stories, creates a child Task first) |
 | `r` | Refresh work item list from Azure DevOps |
 | `m` | Open Tools menu |
 | `q` | Quit (saves all active timers) |
@@ -123,6 +123,16 @@ Start-TimeTracker -Reconfigure
 6. Changes are saved to Azure DevOps automatically
 
 > Items without time tracking fields (e.g., Features, Epics) will show a message that time tracking is not supported.
+
+### Time Tracking on User Stories
+
+User Stories do not carry time tracking fields themselves. When you press `t` on a User Story, the tracker automatically:
+
+1. Creates a new **Task** child item with the title `<ID> <User Story title>` (e.g. `143748 Implement login page`)
+2. Sets **Original Estimate** and **Remaining Work** to **5 hours**
+3. Assigns the task to the same person as the User Story and sets its state to **Active**
+4. Links it as a child of the User Story in Azure DevOps
+5. Selects the new task in the list and starts the timer on it immediately
 
 ## Work Item Display
 

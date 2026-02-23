@@ -70,7 +70,7 @@ function Start-TimeTracker {
         return $tree
     }
 
-    $items = Refresh-Items -Config $config
+    $items = [System.Collections.ArrayList]@(Refresh-Items -Config $config)
 
     # ── State ────────────────────────────────────────────────────────
     $selectedIndex = 0
@@ -214,7 +214,7 @@ function Start-TimeTracker {
                         'R' {
                             $statusMessage = "Refreshing..."
                             [Console]::Clear()
-                            $items = Refresh-Items -Config $config
+                            $items = [System.Collections.ArrayList]@(Refresh-Items -Config $config)
                             $validItems = @($items | Where-Object { $_.Id -and $_.Title })
                             $selectedIndex = 0
                             $scrollOffset = 0
@@ -283,7 +283,53 @@ function Start-TimeTracker {
                                                     ($null -ne $item.CompletedWork) -or
                                                     ($null -ne $item.RemainingWork)
 
-                                    if (-not $supportsTime) {
+                                    if (-not $supportsTime -and $item.Type -eq 'User Story') {
+                                        # Create a child Task for the User Story
+                                        $taskTitle = "$($item.Id) $($item.Title)"
+                                        $assignedTo = Get-SafeField -Fields $item.Raw.fields -Name 'System.AssignedTo'
+                                        $assignedToValue = if ($assignedTo -and $assignedTo.uniqueName) { $assignedTo.uniqueName } else { "" }
+                                        $statusMessage = "Creating child task for #$itemId..."
+                                        try {
+                                            $newWI = New-ChildTask -Organization $config.Organization `
+                                                -Project $config.Project -PAT $config.PAT `
+                                                -ParentId $itemId -Title $taskTitle `
+                                                -AssignedTo $assignedToValue `
+                                                -OriginalEstimate 5 -RemainingWork 5
+
+                                            $newId = $newWI.id
+                                            # Add the new task to the item list right after the parent
+                                            $newTaskNode = @{
+                                                Id               = $newId
+                                                Title            = $taskTitle
+                                                Type             = 'Task'
+                                                State            = $newWI.fields.'System.State'
+                                                ParentId         = $itemId
+                                                OriginalEstimate = 5.0
+                                                CompletedWork    = $null
+                                                RemainingWork    = 5.0
+                                                IsMine           = $true
+                                                Depth            = $item.Depth + 1
+                                                Children         = @()
+                                                Raw              = $newWI
+                                            }
+                                            # Insert after current item
+                                            $insertIdx = $items.IndexOf($item)
+                                            if ($insertIdx -ge 0) {
+                                                $items.Insert($insertIdx + 1, $newTaskNode)
+                                                $selectedIndex = $insertIdx + 1
+                                            } else {
+                                                [void]$items.Add($newTaskNode)
+                                                $selectedIndex = $items.Count - 1
+                                            }
+                                            # Start timer on the new task
+                                            $activeTimers[$newId] = [System.Diagnostics.Stopwatch]::StartNew()
+                                            $statusMessage = "Created task #$newId and started timer"
+                                        }
+                                        catch {
+                                            $statusMessage = "Error creating task: $($_.Exception.Message)"
+                                        }
+                                    }
+                                    elseif (-not $supportsTime) {
                                         $statusMessage = "Item #$itemId has no time tracking fields"
                                     }
                                     else {
@@ -840,7 +886,7 @@ function Start-TimeTracker {
 
                                     # Reload items with new config
                                     [Console]::Clear()
-                                    $items = Refresh-Items -Config $config
+                                    $items = [System.Collections.ArrayList]@(Refresh-Items -Config $config)
                                     $validItems = @($items | Where-Object { $_.Id -and $_.Title })
                                     $selectedIndex = 0
                                     $scrollOffset = 0
