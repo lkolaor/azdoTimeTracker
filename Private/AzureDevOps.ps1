@@ -686,3 +686,22 @@ function Update-WorkItemField {
         throw "Error updating field '${FieldPath}' on work item ${WorkItemId}: $($_.Exception.Message)"
     }
 }
+# ── Delete (soft-delete) a work item ───────────────────────────
+function Remove-WorkItem {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT,
+        [int]$WorkItemId
+    )
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $url = "https://dev.azure.com/$Organization/$Project/_apis/wit/workitems/${WorkItemId}?api-version=7.1"
+
+    try {
+        Invoke-RestMethod -Uri $url -Method Delete -Headers $headers -ErrorAction Stop | Out-Null
+    }
+    catch {
+        throw "Error deleting work item ${WorkItemId}: $($_.Exception.Message)"
+    }
+}

@@ -345,9 +345,10 @@ function Start-TimeTracker {
                                 SelectedIndex = 0
                                 MenuItems     = @(
                                     @{ Label = "Reconfigure (Organization, Project, PAT)"; Action = "reconfigure" }
-                                    @{ Label = "View debug log"; Action = "viewlog" }
-                                    @{ Label = "View README"; Action = "readme" }
-                                    @{ Label = "About"; Action = "about" }
+                                    @{ Label = "Delete selected Task";                    Action = "deletetask"  }
+                                    @{ Label = "View debug log";                          Action = "viewlog"     }
+                                    @{ Label = "View README";                             Action = "readme"      }
+                                    @{ Label = "About";                                  Action = "about"       }
                                 )
                             }
                             $mode = "toolsmenu"
@@ -960,6 +961,45 @@ function Start-TimeTracker {
                                     }
                                     else {
                                         $statusMessage = "README.md not found"
+                                    }
+                                }
+                                "deletetask" {
+                                    $targetItem = if ($validItems.Count -gt 0) { $validItems[$selectedIndex] } else { $null }
+                                    if ($null -eq $targetItem -or $targetItem.Type -ne 'Task') {
+                                        $statusMessage = "Delete Task only works on Task items (selected item is '$($targetItem.Type)')"
+                                    }
+                                    else {
+                                        [Console]::Clear()
+                                        [Console]::CursorVisible = $true
+                                        Write-Host ""
+                                        Write-Host "  Delete Task" -ForegroundColor Red
+                                        Write-Host ""
+                                        Write-Host "  #$($targetItem.Id) $($targetItem.Title)" -ForegroundColor White
+                                        Write-Host ""
+                                        Write-Host "  This will move the task to the Azure DevOps recycle bin." -ForegroundColor Yellow
+                                        Write-Host "  Press [y] to confirm, any other key to cancel." -ForegroundColor Yellow
+                                        Write-Host ""
+                                        $confirm = [Console]::ReadKey($true)
+                                        [Console]::CursorVisible = $false
+                                        if ($confirm.KeyChar -eq 'y' -or $confirm.KeyChar -eq 'Y') {
+                                            try {
+                                                Remove-WorkItem -Organization $config.Organization `
+                                                    -Project $config.Project -PAT $config.PAT `
+                                                    -WorkItemId $targetItem.Id
+                                                # Remove from local list
+                                                [void]$items.Remove($targetItem)
+                                                if ($selectedIndex -ge $items.Count) {
+                                                    $selectedIndex = [Math]::Max(0, $items.Count - 1)
+                                                }
+                                                $statusMessage = "Deleted Task #$($targetItem.Id)"
+                                            }
+                                            catch {
+                                                $statusMessage = "Error: $($_.Exception.Message)"
+                                            }
+                                        }
+                                        else {
+                                            $statusMessage = "Delete cancelled"
+                                        }
                                     }
                                 }
                                 "about" {

@@ -1,6 +1,7 @@
 # AzDoTimeTracker
 
 An interactive PowerShell module for tracking time against Azure DevOps work items.
+Please note that this whole thing is vibe coded, use at your own peril.
 
 ## Features
 
@@ -112,6 +113,29 @@ Start-TimeTracker -Reconfigure
 |------|--------|
 | `Ctrl+S` | Save |
 | `Ctrl+Q` | Cancel |
+
+### Tools Menu
+
+Press `m` from the list view to open the Tools menu. Available options:
+
+| Option | Description |
+|--------|-------------|
+| Reconfigure | Re-enter organization, project, and PAT |
+| Delete selected Task | Permanently deletes the currently selected Task (Tasks only — requires confirmation) |
+| View debug log | Shows the last 50 lines of the debug log |
+| View README | Browse this README inside the TUI |
+| About | Show version and module info |
+
+#### Deleting a Task
+
+1. Select the Task you want to delete in the list
+2. Press `m` to open the Tools menu
+3. Choose **Delete selected Task**
+4. A confirmation screen shows the task ID and title
+5. Press `y` to confirm — the task is moved to the Azure DevOps recycle bin
+6. Any other key cancels the operation
+
+> Only **Task** type items can be deleted through this menu. Selecting any other type (User Story, Bug, etc.) will show an error and take no action.
 
 ## Time Tracking
 
