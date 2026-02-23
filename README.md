@@ -92,7 +92,7 @@ Start-TimeTracker -Reconfigure
 | `Home` / `End` | Jump to first/last item |
 | `Enter` | View item details (description + comments) |
 | `t` | Start/stop time tracking on selected item (on User Stories, creates a child Task first) |
-| `r` | Refresh work item list from Azure DevOps |
+| `r` | Refresh work item list from Azure DevOps (selection is preserved) |
 | `m` | Open Tools menu |
 | `q` | Quit (saves all active timers) |
 

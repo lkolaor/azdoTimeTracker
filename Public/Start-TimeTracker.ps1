@@ -218,10 +218,19 @@ function Start-TimeTracker {
                         }
                         'R' {
                             $statusMessage = "Refreshing..."
+                            $prevSelectedId = if ($validItems.Count -gt 0) { $validItems[$selectedIndex].Id } else { $null }
                             [Console]::Clear()
                             $items = [System.Collections.ArrayList]@(Refresh-Items -Config $config)
                             $validItems = @($items | Where-Object { $_.Id -and $_.Title })
                             $selectedIndex = 0
+                            if ($prevSelectedId) {
+                                for ($i = 0; $i -lt $validItems.Count; $i++) {
+                                    if ($validItems[$i].Id -eq $prevSelectedId) {
+                                        $selectedIndex = $i
+                                        break
+                                    }
+                                }
+                            }
                             $scrollOffset = 0
                             $statusMessage = "Refreshed - $($validItems.Count) items loaded"
                             [Console]::Clear()
