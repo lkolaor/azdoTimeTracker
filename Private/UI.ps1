@@ -157,6 +157,38 @@ function Wrap-Text {
     return $result
 }
 
+# ── Render tab bar line ─────────────────────────────────────────────
+function Render-TabBarLine {
+    param(
+        [array]$TabNames,
+        [int]$ActiveTabIndex,
+        [int]$Width
+    )
+
+    $tabX = 0
+    for ($ti = 0; $ti -lt $TabNames.Count; $ti++) {
+        $label = " $($ti + 1):$($TabNames[$ti]) "
+        if ($ti -eq $ActiveTabIndex) {
+            Write-Host $label -ForegroundColor White -BackgroundColor DarkCyan -NoNewline
+        }
+        else {
+            Write-Host $label -ForegroundColor Gray -NoNewline
+        }
+        if ($ti -lt $TabNames.Count - 1) {
+            Write-Host "|" -ForegroundColor DarkGray -NoNewline
+            $tabX += 1
+        }
+        $tabX += $label.Length
+    }
+    $remaining = [Math]::Max(0, $Width - $tabX)
+    if ($remaining -gt 0) {
+        Write-Host (" " * $remaining)
+    }
+    else {
+        Write-Host ""
+    }
+}
+
 # ── Render the main list ────────────────────────────────────────────
 function Render-WorkItemList {
     param(
@@ -164,7 +196,12 @@ function Render-WorkItemList {
         [int]$SelectedIndex,
         [int]$ScrollOffset,
         [string]$StatusMessage = "",
-        [hashtable]$ActiveTimers = @{}
+        [hashtable]$ActiveTimers = @{},
+        [array]$TabNames = @(),
+        [int]$ActiveTabIndex = -1,
+        [bool]$ShowAllEnabled = $false,
+        [bool]$ShowAllAvailable = $false,
+        [string]$NoItemsMessage = "No work items found."
     )
 
     [Console]::CursorVisible = $false
@@ -178,16 +215,30 @@ function Render-WorkItemList {
     $padLen = [Math]::Max(0, $width - $header.Length)
     Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkBlue
 
-    $helpLine = " [Arrows] Navigate  [Enter] Info  [t] Timer  [r] Refresh  [m] Tools  [q] Quit "
+    # Tab bar
+    $tabBarLines = 0
+    if ($TabNames.Count -gt 0 -and $ActiveTabIndex -ge 0) {
+        $tabBarLines = 1
+        Render-TabBarLine -TabNames $TabNames -ActiveTabIndex $ActiveTabIndex -Width $width
+    }
+
+    $helpParts = " [Arrows] Navigate  [Enter] Info  [t] Timer  [r] Refresh  [m] Tools"
+    if ($ShowAllAvailable) {
+        $helpParts += if ($ShowAllEnabled) { "  [x] Active only" } else { "  [x] Show all" }
+    }
+    if ($ActiveTabIndex -eq 4) { $helpParts += "  [/] Search" }
+    if ($TabNames.Count -gt 0) { $helpParts += "  [Tab] Switch tab" }
+    $helpParts += "  [q] Quit "
+    $helpLine = $helpParts
     $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
     Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
 
     # Available lines for items
-    $availableLines = $height - 4  # header (1) + help (1) + status (1) + bottom margin (1)
+    $availableLines = $height - 4 - $tabBarLines  # header (1) + [tab bar] + help (1) + status (1) + bottom margin (1)
 
     if ($Items.Count -eq 0) {
         Write-Host ""
-        Write-Host "  No work items found assigned to you." -ForegroundColor Yellow
+        Write-Host "  $NoItemsMessage" -ForegroundColor Yellow
         Write-Host "  Press 'r' to refresh or 'q' to quit." -ForegroundColor Gray
         $remaining = $availableLines - 2
         for ($l = 0; $l -lt $remaining; $l++) {
@@ -274,16 +325,16 @@ function Render-WorkItemList {
     if ($StatusMessage) {
         $statusText = " $StatusMessage$timerInfo"
         $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
-        Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkGreen
+        Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkGreen -NoNewline
     }
     else {
         $countMsg = " $($Items.Count) items$timerInfo"
         $statusPadded = $countMsg + (" " * [Math]::Max(0, $width - $countMsg.Length))
         if ($timerCount -gt 0) {
-            Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkRed
+            Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkRed -NoNewline
         }
         else {
-            Write-Host $statusPadded -ForegroundColor Gray -BackgroundColor DarkGray
+            Write-Host $statusPadded -ForegroundColor Gray -BackgroundColor DarkGray -NoNewline
         }
     }
 
@@ -369,7 +420,9 @@ function Render-DetailView {
         $adoUrl = "https://dev.azure.com/$Organization/$([Uri]::EscapeDataString($Project))/_workitems/edit/$($Item.Id)"
         [void]$lines.Add("  URL:   $adoUrl")
     }
-    [void]$lines.Add("  State: $($Item.State)")
+    [void]$lines.Add("  State:    $($Item.State)")
+    $assignee = if ($Item.ContainsKey('AssignedTo') -and $Item.AssignedTo) { $Item.AssignedTo } else { "(unassigned)" }
+    [void]$lines.Add("  Assigned: $assignee")
 
     if ($null -ne $Item.OriginalEstimate) {
         [void]$lines.Add("  Original Estimate: $($Item.OriginalEstimate) hours")
@@ -894,4 +947,245 @@ function Render-StatusPicker {
     $statusLine = " Choose a status "
     $padded3 = $statusLine + (" " * [Math]::Max(0, $width - $statusLine.Length))
     Write-Host $padded3 -ForegroundColor Gray -BackgroundColor DarkGray
+}
+
+# ── Interactive text input with live autocomplete suggestions ──────
+function Read-WithSuggestions {
+    param(
+        [string]$Prompt,
+        [string]$InitialValue        = "",
+        [string]$Organization        = "",
+        [string]$PAT                 = "",
+        [int]$MinCharsForSuggestions = 3,
+        [int]$MaxSuggestions         = 8
+    )
+
+    $text             = $InitialValue
+    $suggestions      = @()
+    $suggestionIndex  = -1
+    $lastFetchedText  = ""
+
+    $screenWidth      = [Console]::WindowWidth
+    $screenHeight     = [Console]::WindowHeight
+    $inputRow         = $screenHeight - 1          # last row
+    $suggestAreaTop   = $inputRow - $MaxSuggestions - 1
+
+    [Console]::CursorVisible = $true
+
+    function DrawInput {
+        param([string]$T)
+        [Console]::SetCursorPosition(0, $inputRow)
+        $line   = " $Prompt [$T]"
+        $padded = $line + (" " * [Math]::Max(0, $screenWidth - $line.Length))
+        Write-Host $padded -NoNewline -ForegroundColor White -BackgroundColor DarkCyan
+        # Park the cursor right after the typed text
+        $col = [Math]::Min(" $Prompt [".Length + $T.Length, $screenWidth - 1)
+        [Console]::SetCursorPosition($col, $inputRow)
+    }
+
+    function DrawSuggestions {
+        param([array]$Suggs, [int]$SelIdx)
+        $count = [Math]::Min($Suggs.Count, $MaxSuggestions)
+        # Clear the entire suggestion area first
+        for ($r = $suggestAreaTop; $r -lt $inputRow; $r++) {
+            [Console]::SetCursorPosition(0, $r)
+            Write-Host (" " * $screenWidth) -NoNewline
+        }
+        if ($count -gt 0) {
+            [Console]::SetCursorPosition(0, $suggestAreaTop)
+            $hdr = " Suggestions  (↑↓ select, Enter confirm, Esc cancel) "
+            $hdrPad = $hdr + (" " * [Math]::Max(0, $screenWidth - $hdr.Length))
+            Write-Host $hdrPad -NoNewline -ForegroundColor Cyan -BackgroundColor DarkGray
+            for ($i = 0; $i -lt $count; $i++) {
+                $row = $suggestAreaTop + 1 + $i
+                if ($row -ge $inputRow) { break }
+                [Console]::SetCursorPosition(0, $row)
+                $lbl    = "  $($Suggs[$i])"
+                $padded = $lbl + (" " * [Math]::Max(0, $screenWidth - $lbl.Length))
+                if ($i -eq $SelIdx) {
+                    Write-Host $padded -NoNewline -ForegroundColor White -BackgroundColor DarkBlue
+                } else {
+                    Write-Host $padded -NoNewline -ForegroundColor Gray
+                }
+            }
+        }
+    }
+
+    # Initial draw
+    DrawSuggestions -Suggs @() -SelIdx -1
+    DrawInput -T $text
+
+    while ($true) {
+        # Refresh suggestions whenever the typed text changes
+        if ($text.Length -ge $MinCharsForSuggestions -and $text -ne $lastFetchedText) {
+            $suggestions     = @(Search-AzDoUsers -Organization $Organization -PAT $PAT -SearchTerm $text)
+            $lastFetchedText = $text
+            $suggestionIndex = -1
+        } elseif ($text.Length -lt $MinCharsForSuggestions -and $suggestions.Count -gt 0) {
+            $suggestions     = @()
+            $lastFetchedText = ""
+            $suggestionIndex = -1
+        }
+
+        DrawSuggestions -Suggs $suggestions -SelIdx $suggestionIndex
+        DrawInput -T $text
+
+        $key = [Console]::ReadKey($true)
+
+        switch ($key.Key) {
+            'Enter' {
+                [Console]::CursorVisible = $false
+                if ($suggestionIndex -ge 0 -and $suggestionIndex -lt $suggestions.Count) {
+                    return $suggestions[$suggestionIndex]
+                }
+                return $text
+            }
+            'Escape' {
+                [Console]::CursorVisible = $false
+                return $null   # signals "cancelled"
+            }
+            'UpArrow' {
+                if ($suggestions.Count -gt 0) {
+                    if ($suggestionIndex -gt 0)  { $suggestionIndex-- }
+                    elseif ($suggestionIndex -eq 0) { $suggestionIndex = -1 }
+                }
+            }
+            'DownArrow' {
+                if ($suggestions.Count -gt 0) {
+                    $maxIdx = [Math]::Min($suggestions.Count, $MaxSuggestions) - 1
+                    if ($suggestionIndex -lt $maxIdx) { $suggestionIndex++ }
+                }
+            }
+            'Backspace' {
+                if ($text.Length -gt 0) {
+                    $text = $text.Substring(0, $text.Length - 1)
+                    $suggestionIndex = -1
+                    if ($text.Length -lt $MinCharsForSuggestions) {
+                        $suggestions     = @()
+                        $lastFetchedText = ""
+                    }
+                }
+            }
+            'Delete' {
+                $text            = ""
+                $suggestions     = @()
+                $lastFetchedText = ""
+                $suggestionIndex = -1
+            }
+            default {
+                if ($key.KeyChar -and -not [char]::IsControl($key.KeyChar)) {
+                    $text            += $key.KeyChar
+                    $suggestionIndex  = -1
+                }
+            }
+        }
+    }
+}
+
+# ── Render query form ───────────────────────────────────────────────
+function Render-QueryForm {
+    param(
+        [hashtable]$QueryData,
+        [array]$TabNames = @(),
+        [int]$ActiveTabIndex = -1,
+        [string]$StatusMessage = ""
+    )
+
+    [Console]::CursorVisible = $false
+    [Console]::SetCursorPosition(0, 0)
+
+    $width = [Console]::WindowWidth
+    $height = [Console]::WindowHeight
+
+    # Header
+    $header = " AZURE DEVOPS TIME TRACKER "
+    $padLen = [Math]::Max(0, $width - $header.Length)
+    Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkBlue
+
+    # Tab bar
+    if ($TabNames.Count -gt 0 -and $ActiveTabIndex -ge 0) {
+        Render-TabBarLine -TabNames $TabNames -ActiveTabIndex $ActiveTabIndex -Width $width
+    }
+
+    # Help
+    $helpLine = " [Up/Down] Navigate  [Enter] Edit field / Search  [ESC] Back  [Tab] Switch tab "
+    $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
+    Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
+
+    # Form content
+    Write-Host ""
+    Write-Host "  SEARCH WORK ITEMS" -ForegroundColor Cyan
+    Write-Host ""
+
+    $formFields = @(
+        @{ Label = "Title contains"; Value = $QueryData.TitleContains; Hint = "" }
+        @{ Label = "State";          Value = $QueryData.State;         Hint = "e.g. Active, New, Closed, or blank for any" }
+        @{ Label = "Type";           Value = $QueryData.Type;          Hint = "e.g. Bug, Task, User Story, or blank for any" }
+        @{ Label = "Assigned to";    Value = $QueryData.AssignedTo;    Hint = "e.g. @me, a name, or blank for any" }
+        @{ Label = "Work Item ID";   Value = $QueryData.WorkItemId;    Hint = "Search by specific ID (ignores other filters)" }
+    )
+
+    $maxLabelLen = ($formFields | ForEach-Object { $_.Label.Length } | Measure-Object -Maximum).Maximum
+
+    for ($i = 0; $i -lt $formFields.Count; $i++) {
+        $f = $formFields[$i]
+        $prefix = if ($i -eq $QueryData.FormSelectedIndex) { " > " } else { "   " }
+        $label = $f.Label.PadRight($maxLabelLen)
+        $val = if ($f.Value) { $f.Value } else { "" }
+        $lineText = "$prefix${label}:  [$val]"
+        $padded = Format-FixedWidth -Text $lineText -Width $width
+        if ($i -eq $QueryData.FormSelectedIndex) {
+            Write-Host $padded -ForegroundColor White -BackgroundColor DarkCyan
+        }
+        else {
+            Write-Host $padded -ForegroundColor White
+        }
+    }
+
+    # Search button
+    Write-Host ""
+    $searchIdx = $formFields.Count
+    $prefix = if ($QueryData.FormSelectedIndex -eq $searchIdx) { " > " } else { "   " }
+    $searchLabel = "${prefix}>>> Run Search <<<"
+    $padded = Format-FixedWidth -Text $searchLabel -Width $width
+    if ($QueryData.FormSelectedIndex -eq $searchIdx) {
+        Write-Host $padded -ForegroundColor White -BackgroundColor DarkGreen
+    }
+    else {
+        Write-Host $padded -ForegroundColor Green
+    }
+
+    # Hint for selected field
+    Write-Host ""
+    if ($QueryData.FormSelectedIndex -lt $formFields.Count) {
+        $hint = $formFields[$QueryData.FormSelectedIndex].Hint
+        if ($hint) {
+            Write-Host (Format-FixedWidth -Text "  $hint" -Width $width) -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host (" " * $width)
+        }
+    }
+    else {
+        Write-Host (Format-FixedWidth -Text "  Press Enter to execute the search" -Width $width) -ForegroundColor DarkGray
+    }
+
+    # Fill remaining lines
+    $usedLines = 3 + 3 + $formFields.Count + 3 + 1  # header area (3) + blank/title/blank (3) + fields + blank/button/blank (3) + hint (1)
+    $remaining = $height - $usedLines - 1
+    for ($l = 0; $l -lt $remaining; $l++) {
+        Write-Host (" " * $width)
+    }
+
+    # Status bar
+    if ($StatusMessage) {
+        $statusText = " $StatusMessage "
+        $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
+        Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkGreen -NoNewline
+    }
+    else {
+        $statusText = " Fill in filters and press Enter on 'Run Search' "
+        $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
+        Write-Host $statusPadded -ForegroundColor Gray -BackgroundColor DarkGray -NoNewline
+    }
 }

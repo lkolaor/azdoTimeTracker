@@ -31,6 +31,33 @@ function Write-TTDebugLog {
     Add-Content -Path $logPath -Value $line -ErrorAction SilentlyContinue
 }
 
+# ── Get the current user's display name via Connection Data API ────
+$script:CachedDisplayName = $null
+function Get-CurrentUserDisplayName {
+    param(
+        [string]$Organization,
+        [string]$PAT
+    )
+
+    if ($script:CachedDisplayName) { return $script:CachedDisplayName }
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $url = "https://dev.azure.com/$Organization/_apis/connectiondata?api-version=7.1"
+
+    try {
+        $result = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop
+        if ($result.authenticatedUser -and $result.authenticatedUser.providerDisplayName) {
+            $script:CachedDisplayName = $result.authenticatedUser.providerDisplayName
+            Write-TTDebugLog "Get-CurrentUserDisplayName: $($script:CachedDisplayName)"
+            return $script:CachedDisplayName
+        }
+    }
+    catch {
+        Write-TTDebugLog "Get-CurrentUserDisplayName error: $($_.Exception.Message)"
+    }
+    return $null
+}
+
 # ── Get my work items via WIQL ─────────────────────────────────────
 function Get-MyWorkItems {
     param(
@@ -203,11 +230,15 @@ function Build-WorkItemTree {
     foreach ($item in $MyItems) {
         $f = $item.fields
         $id = $f.'System.Id'
+        $assignedTo = $null
+        $assignedToField = Get-SafeField -Fields $f -Name 'System.AssignedTo'
+        if ($assignedToField) { $assignedTo = $assignedToField.displayName }
         $allLookup[$id] = @{
             Id              = $id
             Title           = $f.'System.Title'
             Type            = $f.'System.WorkItemType'
             State           = $f.'System.State'
+            AssignedTo      = $assignedTo
             ParentId        = Get-SafeField -Fields $f -Name 'System.Parent'
             OriginalEstimate = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.OriginalEstimate'
             CompletedWork   = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.CompletedWork'
@@ -223,11 +254,15 @@ function Build-WorkItemTree {
         $f = $item.fields
         $id = $f.'System.Id'
         if (-not $allLookup.ContainsKey($id)) {
+            $assignedTo = $null
+            $assignedToField = Get-SafeField -Fields $f -Name 'System.AssignedTo'
+            if ($assignedToField) { $assignedTo = $assignedToField.displayName }
             $allLookup[$id] = @{
                 Id              = $id
                 Title           = $f.'System.Title'
                 Type            = $f.'System.WorkItemType'
                 State           = $f.'System.State'
+                AssignedTo      = $assignedTo
                 ParentId        = Get-SafeField -Fields $f -Name 'System.Parent'
                 OriginalEstimate = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.OriginalEstimate'
                 CompletedWork   = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.CompletedWork'
@@ -759,4 +794,385 @@ function Remove-WorkItem {
     catch {
         throw "Error deleting work item ${WorkItemId}: $($_.Exception.Message)"
     }
+}
+
+# ── Helper: Convert raw API item to flat work item hashtable ─────
+function ConvertTo-FlatWorkItem {
+    param($RawItem)
+    $f = $RawItem.fields
+    $assignedTo = $null
+    $assignedToField = Get-SafeField -Fields $f -Name 'System.AssignedTo'
+    if ($assignedToField) {
+        $assignedTo = $assignedToField.displayName
+    }
+    return @{
+        Id               = $f.'System.Id'
+        Title            = $f.'System.Title'
+        Type             = $f.'System.WorkItemType'
+        State            = $f.'System.State'
+        AssignedTo       = $assignedTo
+        ParentId         = Get-SafeField -Fields $f -Name 'System.Parent'
+        OriginalEstimate = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.OriginalEstimate'
+        CompletedWork    = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.CompletedWork'
+        RemainingWork    = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.RemainingWork'
+        IsMine           = $true
+        Depth            = 0
+        Children         = @()
+        Raw              = $RawItem
+    }
+}
+
+# ── Helper: Batch-fetch work item details from IDs ───────────────
+function Get-WorkItemDetailsFromIds {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT,
+        [array]$Ids
+    )
+
+    if (-not $Ids -or $Ids.Count -eq 0) { return @() }
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $baseUrl = "https://dev.azure.com/$Organization/$Project/_apis"
+    $batchSize = 200
+
+    $fields = @(
+        "System.Id",
+        "System.Title",
+        "System.WorkItemType",
+        "System.State",
+        "System.AssignedTo",
+        "System.Description",
+        "System.Parent",
+        "Microsoft.VSTS.Scheduling.OriginalEstimate",
+        "Microsoft.VSTS.Scheduling.CompletedWork",
+        "Microsoft.VSTS.Scheduling.RemainingWork"
+    ) -join ","
+
+    $allItems = [System.Collections.ArrayList]::new()
+
+    for ($i = 0; $i -lt $Ids.Count; $i += $batchSize) {
+        $batchIds = $Ids[$i .. [Math]::Min($i + $batchSize - 1, $Ids.Count - 1)]
+        $idsString = $batchIds -join ","
+        $detailUrl = "$baseUrl/wit/workitems?ids=$idsString&fields=$fields&api-version=7.1"
+
+        try {
+            $details = Invoke-RestMethod -Uri $detailUrl -Method Get -Headers $headers -ErrorAction Stop
+            foreach ($item in $details.value) {
+                [void]$allItems.Add((ConvertTo-FlatWorkItem -RawItem $item))
+            }
+        }
+        catch {
+            Write-TTDebugLog "Get-WorkItemDetailsFromIds error: $($_.Exception.Message)"
+        }
+    }
+
+    return $allItems
+}
+
+# ── Search Azure DevOps users by display name prefix ─────────────
+function Search-AzDoUsers {
+    param(
+        [string]$Organization,
+        [string]$PAT,
+        [string]$SearchTerm
+    )
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+
+    # ── Attempt 1: IdentityPicker (POST) ──────────────────────────
+    $url1 = "https://dev.azure.com/$Organization/_apis/IdentityPicker/Identities?api-version=6.0"
+    $body1 = @{
+        query           = $SearchTerm
+        identityTypes   = @("user")
+        operationScopes = @("ims")
+        properties      = @("DisplayName", "SubjectDescriptor")
+    } | ConvertTo-Json -Depth 5
+
+    try {
+        $r1 = Invoke-RestMethod -Uri $url1 -Method Post -Headers $headers `
+            -ContentType "application/json" -Body $body1 -ErrorAction Stop
+        Write-TTDebugLog "Search-AzDoUsers IdentityPicker raw: $($r1 | ConvertTo-Json -Depth 6 -Compress)"
+        if ($r1.results -and $r1.results.Count -gt 0) {
+            $identities = $r1.results[0].identities
+            if ($identities -and $identities.Count -gt 0) {
+                $names = @($identities | Where-Object { $_.displayName } | ForEach-Object { $_.displayName })
+                Write-TTDebugLog "Search-AzDoUsers IdentityPicker found $($names.Count) names"
+                if ($names.Count -gt 0) { return $names }
+            }
+        }
+    }
+    catch {
+        Write-TTDebugLog "Search-AzDoUsers IdentityPicker error: $($_.Exception.Message)"
+    }
+
+    # ── Attempt 2: vssps identities GET ───────────────────────────
+    $encoded = [Uri]::EscapeDataString($SearchTerm)
+    $url2 = "https://vssps.dev.azure.com/$Organization/_apis/identities?searchFilter=General&filterValue=$encoded&queryMembership=None&api-version=7.1"
+    try {
+        $r2 = Invoke-RestMethod -Uri $url2 -Method Get -Headers $headers -ErrorAction Stop
+        Write-TTDebugLog "Search-AzDoUsers vssps raw count: $(if ($r2.value) { $r2.value.Count } else { 0 })"
+        if ($r2.value -and $r2.value.Count -gt 0) {
+            $names = @($r2.value |
+                Where-Object { $_.isActive -ne $false -and $_.providerDisplayName } |
+                ForEach-Object { $_.providerDisplayName })
+            Write-TTDebugLog "Search-AzDoUsers vssps found $($names.Count) names"
+            if ($names.Count -gt 0) { return $names }
+        }
+    }
+    catch {
+        Write-TTDebugLog "Search-AzDoUsers vssps error: $($_.Exception.Message)"
+    }
+
+    # ── Attempt 3: Graph users (continuationToken paging) ─────────
+    $url3 = "https://vssps.dev.azure.com/$Organization/_apis/graph/users?api-version=7.1-preview.1"
+    try {
+        $r3 = Invoke-RestMethod -Uri $url3 -Method Get -Headers $headers -ErrorAction Stop
+        Write-TTDebugLog "Search-AzDoUsers graph raw count: $(if ($r3.value) { $r3.value.Count } else { 0 })"
+        if ($r3.value -and $r3.value.Count -gt 0) {
+            $lower = $SearchTerm.ToLower()
+            $names = @($r3.value |
+                Where-Object { $_.displayName -and $_.displayName.ToLower().Contains($lower) } |
+                ForEach-Object { $_.displayName })
+            Write-TTDebugLog "Search-AzDoUsers graph found $($names.Count) matching names"
+            if ($names.Count -gt 0) { return $names }
+        }
+    }
+    catch {
+        Write-TTDebugLog "Search-AzDoUsers graph error: $($_.Exception.Message)"
+    }
+
+    Write-TTDebugLog "Search-AzDoUsers: all attempts exhausted, returning empty"
+    return @()
+}
+
+# ── Get work items I've been mentioned in ─────────────────────────
+function Get-MentionedWorkItems {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT,
+        [switch]$IncludeClosed
+    )
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $baseUrl = "https://dev.azure.com/$Organization/$Project/_apis"
+    $wiqlUrl = "$baseUrl/wit/wiql?api-version=7.1"
+
+    $stateFilter = ""
+    if (-not $IncludeClosed) {
+        $stateFilter = @"
+
+  AND [System.State] <> 'Closed'
+  AND [System.State] <> 'Removed'
+  AND [System.State] <> 'Done'
+  AND [System.State] <> 'Released'
+"@
+    }
+
+    $queryText = @"
+SELECT [System.Id], [System.Title]
+FROM WorkItems
+WHERE [System.Id] IN (@RecentMentions)$stateFilter
+ORDER BY [System.ChangedDate] DESC
+"@
+
+    $wiql = @{ query = $queryText } | ConvertTo-Json
+    Write-TTDebugLog "Get-MentionedWorkItems WIQL: $queryText"
+
+    try {
+        $result = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers `
+            -ContentType "application/json" -Body $wiql -ErrorAction Stop
+    }
+    catch {
+        Write-TTDebugLog "Get-MentionedWorkItems error: $($_.Exception.Message)"
+        return @()
+    }
+
+    if (-not $result.workItems -or $result.workItems.Count -eq 0) {
+        return @()
+    }
+
+    $ids = @($result.workItems | ForEach-Object { $_.id } | Select-Object -First 200)
+    return @(Get-WorkItemDetailsFromIds -Organization $Organization -Project $Project -PAT $PAT -Ids $ids)
+}
+
+# ── Get work items I'm following ──────────────────────────────────
+function Get-FollowingWorkItems {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT,
+        [switch]$IncludeClosed
+    )
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $baseUrl = "https://dev.azure.com/$Organization/$Project/_apis"
+    $wiqlUrl = "$baseUrl/wit/wiql?api-version=7.1"
+
+    $stateFilter = ""
+    if (-not $IncludeClosed) {
+        $stateFilter = @"
+
+  AND [System.State] <> 'Closed'
+  AND [System.State] <> 'Removed'
+  AND [System.State] <> 'Done'
+  AND [System.State] <> 'Released'
+"@
+    }
+
+    $queryText = @"
+SELECT [System.Id]
+FROM WorkItems
+WHERE [System.Id] IN (@Follows)$stateFilter
+ORDER BY [System.ChangedDate] DESC
+"@
+
+    $wiql = @{ query = $queryText } | ConvertTo-Json
+    Write-TTDebugLog "Get-FollowingWorkItems WIQL: $queryText"
+
+    try {
+        $result = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers `
+            -ContentType "application/json" -Body $wiql -ErrorAction Stop
+    }
+    catch {
+        Write-TTDebugLog "Get-FollowingWorkItems error: $($_.Exception.Message)"
+        return @()
+    }
+
+    if (-not $result.workItems -or $result.workItems.Count -eq 0) {
+        return @()
+    }
+
+    $ids = @($result.workItems | ForEach-Object { $_.id } | Select-Object -First 200)
+    return @(Get-WorkItemDetailsFromIds -Organization $Organization -Project $Project -PAT $PAT -Ids $ids)
+}
+
+# ── Get work items created by me ─────────────────────────────────
+function Get-CreatedByMeWorkItems {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT,
+        [switch]$IncludeClosed
+    )
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $baseUrl = "https://dev.azure.com/$Organization/$Project/_apis"
+    $wiqlUrl = "$baseUrl/wit/wiql?api-version=7.1"
+
+    $stateFilter = ""
+    if (-not $IncludeClosed) {
+        $stateFilter = @"
+
+  AND [System.State] <> 'Closed'
+  AND [System.State] <> 'Removed'
+  AND [System.State] <> 'Done'
+  AND [System.State] <> 'Released'
+"@
+    }
+
+    $queryText = @"
+SELECT [System.Id]
+FROM WorkItems
+WHERE [System.CreatedBy] = @me$stateFilter
+ORDER BY [System.CreatedDate] DESC
+"@
+
+    $wiql = @{ query = $queryText } | ConvertTo-Json
+    Write-TTDebugLog "Get-CreatedByMeWorkItems WIQL: $queryText"
+
+    try {
+        $result = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers `
+            -ContentType "application/json" -Body $wiql -ErrorAction Stop
+    }
+    catch {
+        Write-TTDebugLog "Get-CreatedByMeWorkItems error: $($_.Exception.Message)"
+        return @()
+    }
+
+    if (-not $result.workItems -or $result.workItems.Count -eq 0) {
+        return @()
+    }
+
+    $ids = @($result.workItems | ForEach-Object { $_.id } | Select-Object -First 200)
+    return @(Get-WorkItemDetailsFromIds -Organization $Organization -Project $Project -PAT $PAT -Ids $ids)
+}
+
+# ── Search work items with filters ───────────────────────────────
+function Search-WorkItemsByFilters {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT,
+        [string]$TitleContains = "",
+        [string]$StateFilter = "",
+        [string]$TypeFilter = "",
+        [string]$AssignedTo = "",
+        [int]$WorkItemId = 0
+    )
+
+    # If searching by ID, just fetch that specific item
+    if ($WorkItemId -gt 0) {
+        $item = Get-WorkItemDetail -Organization $Organization -Project $Project `
+            -PAT $PAT -WorkItemId $WorkItemId
+        if ($item) {
+            return @(ConvertTo-FlatWorkItem -RawItem $item)
+        }
+        return @()
+    }
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $baseUrl = "https://dev.azure.com/$Organization/$Project/_apis"
+    $wiqlUrl = "$baseUrl/wit/wiql?api-version=7.1"
+
+    $conditions = [System.Collections.ArrayList]::new()
+
+    if ($TitleContains) {
+        [void]$conditions.Add("[System.Title] Contains '$($TitleContains -replace "'", "''")'")
+    }
+
+    if ($StateFilter -and $StateFilter -ne 'Any') {
+        [void]$conditions.Add("[System.State] = '$($StateFilter -replace "'", "''")'")
+    }
+
+    if ($TypeFilter -and $TypeFilter -ne 'Any') {
+        [void]$conditions.Add("[System.WorkItemType] = '$($TypeFilter -replace "'", "''")'")
+    }
+
+    if ($AssignedTo) {
+        if ($AssignedTo -eq '@me') {
+            [void]$conditions.Add("[System.AssignedTo] = @me")
+        }
+        else {
+            [void]$conditions.Add("[System.AssignedTo] Contains '$($AssignedTo -replace "'", "''")'")
+        }
+    }
+
+    if ($conditions.Count -eq 0) {
+        return @()
+    }
+
+    $whereClause = $conditions -join " AND "
+    $queryText = "SELECT [System.Id] FROM WorkItems WHERE $whereClause ORDER BY [System.ChangedDate] DESC"
+
+    $wiql = @{ query = $queryText } | ConvertTo-Json
+    Write-TTDebugLog "Search-WorkItemsByFilters WIQL: $queryText"
+
+    try {
+        $result = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers `
+            -ContentType "application/json" -Body $wiql -ErrorAction Stop
+    }
+    catch {
+        Write-TTDebugLog "Search-WorkItemsByFilters error: $($_.Exception.Message)"
+        return @()
+    }
+
+    if (-not $result.workItems -or $result.workItems.Count -eq 0) {
+        return @()
+    }
+
+    $ids = @($result.workItems | ForEach-Object { $_.id } | Select-Object -First 200)
+    return @(Get-WorkItemDetailsFromIds -Organization $Organization -Project $Project -PAT $PAT -Ids $ids)
 }

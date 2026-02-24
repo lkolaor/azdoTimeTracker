@@ -8,8 +8,10 @@ Please note that this whole thing is vibe coded, use at your own peril.
 - Displays all work items (Epics, Features, User Stories, Tasks, Bugs, Incidents) assigned to you
 - Hierarchical view showing parent-child relationships
 - Closed/Done child tasks remain visible in the list as long as their parent is still active
+- **Tabbed views** — switch between Mine, Mentions, Following, Created by me, and Query tabs
+- **Search / Query tab** — filter work items by title, state, type, assigned-to, or ID with live user autocomplete
 - Keyboard-driven navigation
-- View work item details and comments inline
+- View work item details and comments inline (includes assignee)
 - Built-in stopwatch for time tracking
 - Starting a timer on a closed item automatically reactivates it and resets Remaining Work
 - Automatically updates Completed Work and Remaining Work fields in Azure DevOps
@@ -93,6 +95,10 @@ Start-TimeTracker -Reconfigure
 | `Enter` | View item details (description + comments) |
 | `t` | Start/stop time tracking on selected item (on User Stories, creates a child Task first) |
 | `r` | Refresh work item list from Azure DevOps (selection is preserved) |
+| `Tab` / `Shift+Tab` | Cycle through tabs |
+| `1`–`5` | Jump directly to a tab by number |
+| `x` | Toggle showing closed/removed items (Mentions, Following, Created by me tabs) |
+| `/` | Open search form (Query tab) |
 | `m` | Open Tools menu |
 | `q` | Quit (saves all active timers) |
 
@@ -189,6 +195,36 @@ User Stories do not carry time tracking fields themselves. When you press `t` on
 3. Assigns the task to the same person as the User Story and sets its state to **Active**
 4. Links it as a child of the User Story in Azure DevOps
 5. Selects the new task in the list and starts the timer on it immediately
+
+## Tabbed Views
+
+The list is split into five tabs, each with its own independently loaded and scrollable list:
+
+| Tab | Number | Description |
+|-----|--------|-------------|
+| Mine | `1` | Work items assigned to you (default) |
+| Mentions | `2` | Work items where you are mentioned |
+| Following | `3` | Work items you are following |
+| Created by me | `4` | Work items you created |
+| Query | `5` | Custom filtered search |
+
+Switch tabs with `Tab` / `Shift+Tab` or press `1`–`5` directly. Each tab remembers its scroll position and selected item independently.
+
+For the **Mentions**, **Following**, and **Created by me** tabs, press `x` to toggle between active-only and all items (including closed/removed).
+
+## Search (Query Tab)
+
+Press `5` or `Tab` to the **Query** tab, then press `/` (or `Enter`) to open the search form. Available filters:
+
+| Field | Description |
+|-------|-------------|
+| Title contains | Free-text substring match on the work item title |
+| State | Filter by state (e.g. `Active`, `Closed`) |
+| Type | Filter by work item type (e.g. `Task`, `Bug`) |
+| Assigned to | Filter by assignee — supports `@me`, a display name, or leave blank for any. Live autocomplete is shown as you type. |
+| Work Item ID | Fetch a specific item by ID (ignores all other filters when set) |
+
+Navigate the form with `↑` / `↓`, edit a field with `Enter`, and execute the search by selecting **>>> Run Search <<<** and pressing `Enter`. Results are displayed in the Query tab list. Press `r` on the Query tab to re-run the last search.
 
 ## Work Item Display
 

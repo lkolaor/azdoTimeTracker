@@ -53,30 +53,53 @@ function Start-TimeTracker {
     }
 
     # ── Fetch work items ─────────────────────────────────────────────
-    function Refresh-Items {
-        param($Config)
+    function Refresh-TabItems {
+        param($Config, [int]$TabIndex = 0, [bool]$ShowAll = $false)
 
-        Write-Host "`n  Loading work items from Azure DevOps..." -ForegroundColor Cyan
-
-        $result = Get-MyWorkItems -Organization $Config.Organization `
-                                  -Project $Config.Project `
-                                  -PAT $Config.PAT
-
-        if (-not $result -or ($result.MyItems.Count -eq 0)) {
-            return [System.Collections.ArrayList]::new()
+        switch ($TabIndex) {
+            0 {
+                $result = Get-MyWorkItems -Organization $Config.Organization `
+                                          -Project $Config.Project `
+                                          -PAT $Config.PAT
+                if (-not $result -or ($result.MyItems.Count -eq 0)) {
+                    return [System.Collections.ArrayList]::new()
+                }
+                return Build-WorkItemTree -MyItems $result.MyItems -ParentItems $result.ParentItems
+            }
+            1 {
+                return [System.Collections.ArrayList]@(
+                    Get-MentionedWorkItems -Organization $Config.Organization `
+                        -Project $Config.Project -PAT $Config.PAT `
+                        -IncludeClosed:$ShowAll
+                )
+            }
+            2 {
+                return [System.Collections.ArrayList]@(
+                    Get-FollowingWorkItems -Organization $Config.Organization `
+                        -Project $Config.Project -PAT $Config.PAT `
+                        -IncludeClosed:$ShowAll
+                )
+            }
+            3 {
+                return [System.Collections.ArrayList]@(
+                    Get-CreatedByMeWorkItems -Organization $Config.Organization `
+                        -Project $Config.Project -PAT $Config.PAT `
+                        -IncludeClosed:$ShowAll
+                )
+            }
+            4 {
+                return [System.Collections.ArrayList]::new()
+            }
         }
-
-        $tree = Build-WorkItemTree -MyItems $result.MyItems -ParentItems $result.ParentItems
-        return $tree
     }
 
-    $items = [System.Collections.ArrayList]@(Refresh-Items -Config $config)
+    $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex 0)
 
     # ── State ────────────────────────────────────────────────────────
     $selectedIndex = 0
     $scrollOffset = 0
     $statusMessage = ""
-    $mode = "list"  # list | detail | statuspicker | commentpicker | fieldpicker | toolsmenu
+    $mode = "list"  # list | detail | statuspicker | commentpicker | fieldpicker | toolsmenu | queryform
     $detailScrollOffset = 0
     $detailData = $null
     $activeTimers = @{}          # hashtable: workItemId -> Stopwatch
@@ -84,6 +107,26 @@ function Start-TimeTracker {
     $commentPickerData = $null   # @{ Item; Comments; SelectedIndex; Action }
     $fieldPickerData = $null     # @{ Item; Fields; SelectedIndex }
     $toolsMenuData = $null       # @{ SelectedIndex; MenuItems }
+
+    # ── Tab State ────────────────────────────────────────────────────
+    $tabNames = @("Mine", "Mentions", "Following", "Created by me", "Query")
+    $activeTab = 0
+    $tabState = @(
+        @{ Items = $items; SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $true;  EmptyMessage = "No work items found assigned to you." }
+        @{ Items = $null;  SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $false; EmptyMessage = "No work items mentioning you." }
+        @{ Items = $null;  SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $false; EmptyMessage = "No followed work items." }
+        @{ Items = $null;  SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $false; EmptyMessage = "No work items created by you." }
+        @{ Items = $null;  SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $true;  EmptyMessage = "Press / to search for work items." }
+    )
+    $queryData = @{
+        TitleContains     = ""
+        State             = ""
+        Type              = ""
+        AssignedTo        = ""
+        WorkItemId        = ""
+        FormSelectedIndex = 0
+        HasSearched       = $false
+    }
 
     # ── Save a single timer ──────────────────────────────────────────
     function Save-Timer {
@@ -178,7 +221,11 @@ function Start-TimeTracker {
 
                     $scrollOffset = Render-WorkItemList -Items $validItems `
                         -SelectedIndex $selectedIndex -ScrollOffset $scrollOffset `
-                        -StatusMessage $statusMessage -ActiveTimers $activeTimers
+                        -StatusMessage $statusMessage -ActiveTimers $activeTimers `
+                        -TabNames $tabNames -ActiveTabIndex $activeTab `
+                        -ShowAllEnabled $tabState[$activeTab].ShowAll `
+                        -ShowAllAvailable ($activeTab -in 1, 2, 3) `
+                        -NoItemsMessage $tabState[$activeTab].EmptyMessage
                     $statusMessage = ""
 
                     # If timers are running, use non-blocking input with refresh
@@ -217,23 +264,52 @@ function Start-TimeTracker {
                             $selectedIndex = $validItems.Count - 1
                         }
                         'R' {
-                            $statusMessage = "Refreshing..."
-                            $prevSelectedId = if ($validItems.Count -gt 0) { $validItems[$selectedIndex].Id } else { $null }
-                            [Console]::Clear()
-                            $items = [System.Collections.ArrayList]@(Refresh-Items -Config $config)
-                            $validItems = @($items | Where-Object { $_.Id -and $_.Title })
-                            $selectedIndex = 0
-                            if ($prevSelectedId) {
-                                for ($i = 0; $i -lt $validItems.Count; $i++) {
-                                    if ($validItems[$i].Id -eq $prevSelectedId) {
-                                        $selectedIndex = $i
-                                        break
+                            if ($activeTab -eq 4 -and $queryData.HasSearched) {
+                                # Re-run last search on Query tab
+                                [Console]::Clear()
+                                Write-Host "`n  Re-running search..." -ForegroundColor Cyan
+                                $wiId = 0
+                                if ($queryData.WorkItemId -match '^\d+$') { $wiId = [int]$queryData.WorkItemId }
+                                $results = @(Search-WorkItemsByFilters `
+                                    -Organization $config.Organization `
+                                    -Project $config.Project -PAT $config.PAT `
+                                    -TitleContains $queryData.TitleContains `
+                                    -StateFilter $queryData.State `
+                                    -TypeFilter $queryData.Type `
+                                    -AssignedTo $queryData.AssignedTo `
+                                    -WorkItemId $wiId)
+                                $items = [System.Collections.ArrayList]@($results)
+                                $tabState[4].Items = $items
+                                $selectedIndex = 0
+                                $scrollOffset = 0
+                                $statusMessage = "Found $($items.Count) item(s)"
+                                [Console]::Clear()
+                            }
+                            elseif ($activeTab -eq 4) {
+                                # No previous search, open query form
+                                $mode = "queryform"
+                                [Console]::Clear()
+                            }
+                            else {
+                                $statusMessage = "Refreshing..."
+                                $prevSelectedId = if ($validItems.Count -gt 0) { $validItems[$selectedIndex].Id } else { $null }
+                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                $tabState[$activeTab].Items = $items
+                                $tabState[$activeTab].Loaded = $true
+                                $validItems = @($items | Where-Object { $_.Id -and $_.Title })
+                                $selectedIndex = 0
+                                if ($prevSelectedId) {
+                                    for ($i = 0; $i -lt $validItems.Count; $i++) {
+                                        if ($validItems[$i].Id -eq $prevSelectedId) {
+                                            $selectedIndex = $i
+                                            break
+                                        }
                                     }
                                 }
+                                $scrollOffset = 0
+                                $statusMessage = "Refreshed - $($validItems.Count) items loaded"
+                                [Console]::Clear()
                             }
-                            $scrollOffset = 0
-                            $statusMessage = "Refreshed - $($validItems.Count) items loaded"
-                            [Console]::Clear()
                         }
                         'Enter' {
                             # Show detail view
@@ -317,6 +393,7 @@ function Start-TimeTracker {
                                                 Title            = $taskTitle
                                                 Type             = 'Task'
                                                 State            = $newWI.fields.'System.State'
+                                                AssignedTo       = $item.AssignedTo
                                                 ParentId         = $itemId
                                                 OriginalEstimate = 5.0
                                                 CompletedWork    = $null
@@ -449,8 +526,92 @@ function Start-TimeTracker {
                             Write-Host "Goodbye!" -ForegroundColor Cyan
                             return
                         }
+                        'X' {
+                            # Toggle show all (closed/removed) for applicable tabs
+                            if ($activeTab -in 1, 2, 3) {
+                                $tabState[$activeTab].ShowAll = -not $tabState[$activeTab].ShowAll
+                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                $tabState[$activeTab].Items = $items
+                                $tabState[$activeTab].Loaded = $true
+                                $selectedIndex = 0
+                                $scrollOffset = 0
+                                $statusMessage = if ($tabState[$activeTab].ShowAll) { "Showing all items (including closed)" } else { "Showing active items only" }
+                                [Console]::Clear()
+                            }
+                        }
+                        'Tab' {
+                            # Tab / Shift+Tab to cycle through tabs
+                            if ($key.Modifiers -band [ConsoleModifiers]::Shift) {
+                                $newTab = if ($activeTab -eq 0) { $tabNames.Count - 1 } else { $activeTab - 1 }
+                            }
+                            else {
+                                $newTab = if ($activeTab -eq ($tabNames.Count - 1)) { 0 } else { $activeTab + 1 }
+                            }
+                            # Save current tab state
+                            $tabState[$activeTab].SelectedIndex = $selectedIndex
+                            $tabState[$activeTab].ScrollOffset = $scrollOffset
+                            $tabState[$activeTab].Items = $items
+
+                            $activeTab = $newTab
+
+                            if (-not $tabState[$activeTab].Loaded) {
+                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                $tabState[$activeTab].Items = $items
+                                $tabState[$activeTab].Loaded = $true
+                            }
+                            else {
+                                $items = $tabState[$activeTab].Items
+                                if (-not $items) { $items = [System.Collections.ArrayList]::new() }
+                            }
+
+                            $selectedIndex = $tabState[$activeTab].SelectedIndex
+                            $scrollOffset = $tabState[$activeTab].ScrollOffset
+
+                            if ($activeTab -eq 4 -and (-not $queryData.HasSearched)) {
+                                $mode = "queryform"
+                            }
+
+                            [Console]::Clear()
+                        }
                         default {
-                            # Ignore other keys
+                            # Check for tab switching (digit keys 1-5) and '/' for query
+                            $keyChar = $key.KeyChar
+                            if ($keyChar -ge '1' -and $keyChar -le '5') {
+                                $newTab = [int]::Parse($keyChar.ToString()) - 1
+                                if ($newTab -ne $activeTab -and $newTab -lt $tabNames.Count) {
+                                    # Save current tab state
+                                    $tabState[$activeTab].SelectedIndex = $selectedIndex
+                                    $tabState[$activeTab].ScrollOffset = $scrollOffset
+                                    $tabState[$activeTab].Items = $items
+
+                                    $activeTab = $newTab
+
+                                    # Load tab if needed
+                                    if (-not $tabState[$activeTab].Loaded) {
+                                        $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                        $tabState[$activeTab].Items = $items
+                                        $tabState[$activeTab].Loaded = $true
+                                    }
+                                    else {
+                                        $items = $tabState[$activeTab].Items
+                                        if (-not $items) { $items = [System.Collections.ArrayList]::new() }
+                                    }
+
+                                    $selectedIndex = $tabState[$activeTab].SelectedIndex
+                                    $scrollOffset = $tabState[$activeTab].ScrollOffset
+
+                                    # For Query tab with no results yet, auto-open form
+                                    if ($activeTab -eq 4 -and (-not $queryData.HasSearched)) {
+                                        $mode = "queryform"
+                                    }
+
+                                    [Console]::Clear()
+                                }
+                            }
+                            elseif ($keyChar -eq '/' -and $activeTab -eq 4) {
+                                $mode = "queryform"
+                                [Console]::Clear()
+                            }
                         }
                     }
                 }
@@ -959,9 +1120,17 @@ function Start-TimeTracker {
                                     $config = Request-TTConfig
                                     [Console]::CursorVisible = $false
 
-                                    # Reload items with new config
-                                    [Console]::Clear()
-                                    $items = [System.Collections.ArrayList]@(Refresh-Items -Config $config)
+                                    # Reset all tabs and reload current
+                                    for ($ti = 0; $ti -lt $tabState.Count; $ti++) {
+                                        $tabState[$ti].Items = $null
+                                        $tabState[$ti].Loaded = $false
+                                        $tabState[$ti].SelectedIndex = 0
+                                        $tabState[$ti].ScrollOffset = 0
+                                    }
+                                    $queryData.HasSearched = $false
+                                    $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                    $tabState[$activeTab].Items = $items
+                                    $tabState[$activeTab].Loaded = $true
                                     $validItems = @($items | Where-Object { $_.Id -and $_.Title })
                                     $selectedIndex = 0
                                     $scrollOffset = 0
@@ -1114,6 +1283,175 @@ function Start-TimeTracker {
                             [Console]::Clear()
                         }
                         default { }
+                    }
+                }
+
+                "queryform" {
+                    Render-QueryForm -QueryData $queryData `
+                        -TabNames $tabNames -ActiveTabIndex $activeTab `
+                        -StatusMessage $statusMessage
+                    $statusMessage = ""
+
+                    $key = [Console]::ReadKey($true)
+
+                    switch ($key.Key) {
+                        'Escape' {
+                            $mode = "list"
+                            [Console]::Clear()
+                        }
+                        'UpArrow' {
+                            if ($queryData.FormSelectedIndex -gt 0) {
+                                $queryData.FormSelectedIndex--
+                            }
+                        }
+                        'DownArrow' {
+                            if ($queryData.FormSelectedIndex -lt 5) {
+                                $queryData.FormSelectedIndex++
+                            }
+                        }
+                        'Enter' {
+                            if ($queryData.FormSelectedIndex -eq 5) {
+                                # Run search
+                                [Console]::Clear()
+                                Write-Host "`n  Searching..." -ForegroundColor Cyan
+                                $wiId = 0
+                                if ($queryData.WorkItemId -match '^\d+$') {
+                                    $wiId = [int]$queryData.WorkItemId
+                                }
+                                $results = @(Search-WorkItemsByFilters `
+                                    -Organization $config.Organization `
+                                    -Project $config.Project -PAT $config.PAT `
+                                    -TitleContains $queryData.TitleContains `
+                                    -StateFilter $queryData.State `
+                                    -TypeFilter $queryData.Type `
+                                    -AssignedTo $queryData.AssignedTo `
+                                    -WorkItemId $wiId)
+                                $items = [System.Collections.ArrayList]@($results)
+                                $tabState[4].Items = $items
+                                $queryData.HasSearched = $true
+                                $selectedIndex = 0
+                                $scrollOffset = 0
+                                $tabState[4].EmptyMessage = "No results found. Press / to search again."
+                                $statusMessage = "Found $($items.Count) item(s)"
+                                $mode = "list"
+                                [Console]::Clear()
+                            }
+                            else {
+                                # Edit selected field
+                                $fieldKeys = @("TitleContains", "State", "Type", "AssignedTo", "WorkItemId")
+                                $fieldLabels = @(
+                                    "Title contains",
+                                    "State (e.g. Active, New, Closed)",
+                                    "Type (e.g. Bug, Task, User Story)",
+                                    "Assigned to (@me or name)",
+                                    "Work Item ID"
+                                )
+                                $fKey = $fieldKeys[$queryData.FormSelectedIndex]
+                                $currentVal = $queryData[$fKey]
+                                if (-not $currentVal) { $currentVal = "" }
+
+                                if ($fKey -eq 'AssignedTo') {
+                                    # Redraw form so the suggestion overlay has a clean background
+                                    [Console]::Clear()
+                                    Render-QueryForm -QueryData $queryData `
+                                        -TabNames $tabNames -ActiveTabIndex $activeTab `
+                                        -StatusMessage "Type 3+ characters to see name suggestions"
+                                    $newVal = Read-WithSuggestions `
+                                        -Prompt "Assigned to (@me or name)" `
+                                        -InitialValue $currentVal `
+                                        -Organization $config.Organization `
+                                        -PAT $config.PAT
+                                    # $null means Escape (keep old value); "" means cleared intentionally
+                                    if ($null -ne $newVal) {
+                                        $queryData[$fKey] = $newVal
+                                    }
+                                } else {
+                                    [Console]::CursorVisible = $true
+                                    [Console]::SetCursorPosition(0, [Console]::WindowHeight - 1)
+                                    Write-Host (" " * [Console]::WindowWidth) -NoNewline
+                                    [Console]::SetCursorPosition(0, [Console]::WindowHeight - 1)
+                                    $newVal = Read-Host " $($fieldLabels[$queryData.FormSelectedIndex]) [$currentVal]"
+                                    [Console]::CursorVisible = $false
+
+                                    if ($newVal -ne '') {
+                                        $queryData[$fKey] = $newVal
+                                    }
+                                }
+                                [Console]::Clear()
+                            }
+                        }
+                        'Tab' {
+                            # Tab / Shift+Tab to cycle through tabs
+                            if ($key.Modifiers -band [ConsoleModifiers]::Shift) {
+                                $newTab = if ($activeTab -eq 0) { $tabNames.Count - 1 } else { $activeTab - 1 }
+                            }
+                            else {
+                                $newTab = if ($activeTab -eq ($tabNames.Count - 1)) { 0 } else { $activeTab + 1 }
+                            }
+                            $tabState[$activeTab].SelectedIndex = $selectedIndex
+                            $tabState[$activeTab].ScrollOffset = $scrollOffset
+                            $tabState[$activeTab].Items = $items
+
+                            $activeTab = $newTab
+
+                            if (-not $tabState[$activeTab].Loaded) {
+                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                $tabState[$activeTab].Items = $items
+                                $tabState[$activeTab].Loaded = $true
+                            }
+                            else {
+                                $items = $tabState[$activeTab].Items
+                                if (-not $items) { $items = [System.Collections.ArrayList]::new() }
+                            }
+
+                            $selectedIndex = $tabState[$activeTab].SelectedIndex
+                            $scrollOffset = $tabState[$activeTab].ScrollOffset
+
+                            if ($activeTab -eq 4 -and (-not $queryData.HasSearched)) {
+                                $mode = "queryform"
+                            }
+                            else {
+                                $mode = "list"
+                            }
+
+                            [Console]::Clear()
+                        }
+                        default {
+                            # Check for tab switching (digit keys 1-5)
+                            $keyChar = $key.KeyChar
+                            if ($keyChar -ge '1' -and $keyChar -le '5') {
+                                $newTab = [int]::Parse($keyChar.ToString()) - 1
+                                if ($newTab -ne $activeTab -and $newTab -lt $tabNames.Count) {
+                                    $tabState[$activeTab].SelectedIndex = $selectedIndex
+                                    $tabState[$activeTab].ScrollOffset = $scrollOffset
+                                    $tabState[$activeTab].Items = $items
+
+                                    $activeTab = $newTab
+
+                                    if (-not $tabState[$activeTab].Loaded) {
+                                        $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                        $tabState[$activeTab].Items = $items
+                                        $tabState[$activeTab].Loaded = $true
+                                    }
+                                    else {
+                                        $items = $tabState[$activeTab].Items
+                                        if (-not $items) { $items = [System.Collections.ArrayList]::new() }
+                                    }
+
+                                    $selectedIndex = $tabState[$activeTab].SelectedIndex
+                                    $scrollOffset = $tabState[$activeTab].ScrollOffset
+
+                                    if ($activeTab -eq 4 -and (-not $queryData.HasSearched)) {
+                                        $mode = "queryform"
+                                    }
+                                    else {
+                                        $mode = "list"
+                                    }
+
+                                    [Console]::Clear()
+                                }
+                            }
+                        }
                     }
                 }
 
