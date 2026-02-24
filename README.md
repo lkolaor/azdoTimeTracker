@@ -12,7 +12,8 @@ Please note that this whole thing is vibe coded, use at your own peril.
 - **Search / Query tab** — filter work items by title, state, type, assigned-to, or ID with live user autocomplete
 - **Pri tab** — track all children and related items for a configurable parent work item; parent persists across sessions
 - Keyboard-driven navigation
-- View work item details and comments inline (includes assignee)
+- View work item details and comments inline
+- **Assign or unassign** the assignee on any work item directly from the detail view
 - Built-in stopwatch for time tracking
 - Starting a timer on a closed item automatically reactivates it and resets Remaining Work
 - Automatically updates Completed Work and Remaining Work fields in Azure DevOps
@@ -22,7 +23,9 @@ Please note that this whole thing is vibe coded, use at your own peril.
 ## Requirements
 
 - **PowerShell 7.0+** (cross-platform)
-- **Azure DevOps Personal Access Token (PAT)** with **Work Items (Read & Write)** scope
+- **Azure DevOps Personal Access Token (PAT)** with the following scopes:
+  - **Work Items — Read & Write** (required for all features)
+  - **Identity — Read** (required for the assignee search; without it the search falls back to WIQL-based name lookup)
 
 ## Installation
 
@@ -62,7 +65,9 @@ Start-TimeTracker
 1. Go to `https://dev.azure.com/{your-org}/_usersSettings/tokens`
 2. Click **New Token**
 3. Give it a name (e.g. "Time Tracker")
-4. Set the scope to **Work Items → Read & Write**
+4. Set the following scopes:
+   - **Work Items → Read & Write**
+   - **Identity → Read** *(enables fast user search in the assignee picker)*
 5. Copy the generated token
 
 ### 2. Run the application
@@ -109,8 +114,9 @@ Start-TimeTracker -Reconfigure
 |------|--------|
 | `ESC` | Go back to list |
 | `↑` / `↓` | Scroll |
-| `h` | Edit hours (Original Estimate, Completed, Remaining) |
 | `s` | Change status |
+| `n` | Assign / unassign the work item |
+| `h` | Edit hours (Original Estimate, Completed, Remaining) |
 | `f` | Edit fields (title, description, etc.) |
 | `a` | Add comment |
 | `e` | Edit comment |

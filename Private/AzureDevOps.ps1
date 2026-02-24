@@ -665,6 +665,86 @@ function Update-WorkItemState {
     }
 }
 
+# ── Set (or clear) the assignee on a work item ────────────────────
+function Set-WorkItemAssignee {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT,
+        $WorkItemId,
+        [AllowNull()][string]$AssignedTo   # empty string or $null to unassign
+    )
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $url = "https://dev.azure.com/$Organization/$Project/_apis/wit/workitems/${WorkItemId}?api-version=7.1"
+
+    # ADO requires "" (empty string) to clear an identity field; $null is silently ignored
+    $value = if ($AssignedTo) { $AssignedTo } else { "" }
+
+    $patchOps = @(
+        [ordered]@{
+            op    = "add"
+            path  = "/fields/System.AssignedTo"
+            value = $value
+        }
+    )
+
+    $body = "[$( ($patchOps | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }) -join ',' )]"
+    Write-TTDebugLog "Set-WorkItemAssignee: WI=$WorkItemId AssignedTo='$AssignedTo' Body=$body"
+
+    try {
+        $result = Invoke-RestMethod -Uri $url -Method Patch -Headers $headers `
+            -ContentType "application/json-patch+json" `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ErrorAction Stop
+        return $result
+    }
+    catch {
+        throw "Error updating assignee for work item ${WorkItemId}: $($_.Exception.Message)"
+    }
+}
+
+# ── Fetch all members from all teams in a project ─────────────────
+function Get-ProjectTeamMembers {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT
+    )
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $memberNames = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+
+    $encodedProject = [Uri]::EscapeDataString($Project)
+    $teamsUrl = "https://dev.azure.com/$Organization/_apis/projects/$encodedProject/teams?api-version=7.1"
+
+    try {
+        $teamsResult = Invoke-RestMethod -Uri $teamsUrl -Method Get -Headers $headers -ErrorAction Stop
+        Write-TTDebugLog "Get-ProjectTeamMembers: $($teamsResult.value.Count) teams found"
+
+        foreach ($team in $teamsResult.value) {
+            $membersUrl = "https://dev.azure.com/$Organization/_apis/projects/$encodedProject/teams/$($team.id)/members?api-version=7.1"
+            try {
+                $membersResult = Invoke-RestMethod -Uri $membersUrl -Method Get -Headers $headers -ErrorAction Stop
+                foreach ($member in $membersResult.value) {
+                    if ($member.identity -and $member.identity.displayName) {
+                        [void]$memberNames.Add($member.identity.displayName)
+                    }
+                }
+            }
+            catch {
+                Write-TTDebugLog "Get-ProjectTeamMembers: team '$($team.name)' members error: $($_.Exception.Message)"
+            }
+        }
+    }
+    catch {
+        Write-TTDebugLog "Get-ProjectTeamMembers: teams list error: $($_.Exception.Message)"
+    }
+
+    Write-TTDebugLog "Get-ProjectTeamMembers: returning $($memberNames.Count) unique members"
+    return @($memberNames | Sort-Object)
+}
+
 # ── Create a child Task linked to a parent work item ─────────────
 function New-ChildTask {
     param(
@@ -882,30 +962,53 @@ function Search-AzDoUsers {
     param(
         [string]$Organization,
         [string]$PAT,
-        [string]$SearchTerm
+        [string]$SearchTerm,
+        [string]$Project = ""   # optional; enables the WIQL fallback
     )
 
     $headers = Get-AzDoAuthHeader -PAT $PAT
+    $encoded = [Uri]::EscapeDataString($SearchTerm)
 
-    # ── Attempt 1: IdentityPicker (POST) ──────────────────────────
-    $url1 = "https://dev.azure.com/$Organization/_apis/IdentityPicker/Identities?api-version=6.0"
-    $body1 = @{
+    # ── Attempt 1: dev.azure.com identities (standard PAT scope) ──
+    $url1 = "https://dev.azure.com/$Organization/_apis/identities?searchFilter=General&filterValue=$encoded&queryMembership=None&api-version=7.1"
+    try {
+        $r1 = Invoke-RestMethod -Uri $url1 -Method Get -Headers $headers -ErrorAction Stop
+        Write-TTDebugLog "Search-AzDoUsers identities count: $(if ($r1.value) { $r1.value.Count } else { 0 })"
+        if ($r1.value -and $r1.value.Count -gt 0) {
+            $names = @($r1.value |
+                Where-Object { $_.isActive -ne $false -and $_.providerDisplayName } |
+                ForEach-Object { $_.providerDisplayName } |
+                Select-Object -Unique | Sort-Object)
+            if ($names.Count -gt 0) {
+                Write-TTDebugLog "Search-AzDoUsers identities found $($names.Count) names"
+                return $names
+            }
+        }
+    }
+    catch {
+        Write-TTDebugLog "Search-AzDoUsers identities error: $($_.Exception.Message)"
+    }
+
+    # ── Attempt 2: IdentityPicker (POST) ──────────────────────────
+    $url2 = "https://dev.azure.com/$Organization/_apis/IdentityPicker/Identities?api-version=6.0"
+    $body2 = @{
         query           = $SearchTerm
         identityTypes   = @("user")
         operationScopes = @("ims")
         properties      = @("DisplayName", "SubjectDescriptor")
     } | ConvertTo-Json -Depth 5
-
     try {
-        $r1 = Invoke-RestMethod -Uri $url1 -Method Post -Headers $headers `
-            -ContentType "application/json" -Body $body1 -ErrorAction Stop
-        Write-TTDebugLog "Search-AzDoUsers IdentityPicker raw: $($r1 | ConvertTo-Json -Depth 6 -Compress)"
-        if ($r1.results -and $r1.results.Count -gt 0) {
-            $identities = $r1.results[0].identities
+        $r2 = Invoke-RestMethod -Uri $url2 -Method Post -Headers $headers `
+            -ContentType "application/json" -Body $body2 -ErrorAction Stop
+        if ($r2.results -and $r2.results.Count -gt 0) {
+            $identities = $r2.results[0].identities
             if ($identities -and $identities.Count -gt 0) {
-                $names = @($identities | Where-Object { $_.displayName } | ForEach-Object { $_.displayName })
-                Write-TTDebugLog "Search-AzDoUsers IdentityPicker found $($names.Count) names"
-                if ($names.Count -gt 0) { return $names }
+                $names = @($identities | Where-Object { $_.displayName } |
+                    ForEach-Object { $_.displayName } | Select-Object -Unique | Sort-Object)
+                if ($names.Count -gt 0) {
+                    Write-TTDebugLog "Search-AzDoUsers IdentityPicker found $($names.Count) names"
+                    return $names
+                }
             }
         }
     }
@@ -913,40 +1016,36 @@ function Search-AzDoUsers {
         Write-TTDebugLog "Search-AzDoUsers IdentityPicker error: $($_.Exception.Message)"
     }
 
-    # ── Attempt 2: vssps identities GET ───────────────────────────
-    $encoded = [Uri]::EscapeDataString($SearchTerm)
-    $url2 = "https://vssps.dev.azure.com/$Organization/_apis/identities?searchFilter=General&filterValue=$encoded&queryMembership=None&api-version=7.1"
-    try {
-        $r2 = Invoke-RestMethod -Uri $url2 -Method Get -Headers $headers -ErrorAction Stop
-        Write-TTDebugLog "Search-AzDoUsers vssps raw count: $(if ($r2.value) { $r2.value.Count } else { 0 })"
-        if ($r2.value -and $r2.value.Count -gt 0) {
-            $names = @($r2.value |
-                Where-Object { $_.isActive -ne $false -and $_.providerDisplayName } |
-                ForEach-Object { $_.providerDisplayName })
-            Write-TTDebugLog "Search-AzDoUsers vssps found $($names.Count) names"
-            if ($names.Count -gt 0) { return $names }
+    # ── Attempt 3: WIQL – find assignees via work item query ───────
+    # Works with any PAT that has work item read access.
+    if ($Project) {
+        $safe = $SearchTerm -replace "'", "''"
+        $wiqlBody = @{
+            query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = @project AND [System.AssignedTo] Contains '$safe' AND [System.State] <> 'Removed' ORDER BY [System.AssignedTo]"
+        } | ConvertTo-Json
+        $wiqlUrl = "https://dev.azure.com/$Organization/$Project/_apis/wit/wiql?`$top=50&api-version=7.1"
+        try {
+            $wResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers `
+                -ContentType "application/json" -Body $wiqlBody -ErrorAction Stop
+            Write-TTDebugLog "Search-AzDoUsers WIQL items: $(if ($wResult.workItems) { $wResult.workItems.Count } else { 0 })"
+            if ($wResult.workItems -and $wResult.workItems.Count -gt 0) {
+                $ids = @($wResult.workItems | ForEach-Object { $_.id } | Select-Object -First 50)
+                $idsStr = $ids -join ","
+                $detailUrl = "https://dev.azure.com/$Organization/$Project/_apis/wit/workitems?ids=$idsStr&fields=System.AssignedTo&api-version=7.1"
+                $details = Invoke-RestMethod -Uri $detailUrl -Method Get -Headers $headers -ErrorAction Stop
+                $names = @($details.value | ForEach-Object {
+                    $f = Get-SafeField -Fields $_.fields -Name 'System.AssignedTo'
+                    if ($f -and $f.displayName) { $f.displayName }
+                } | Select-Object -Unique | Sort-Object)
+                if ($names.Count -gt 0) {
+                    Write-TTDebugLog "Search-AzDoUsers WIQL found $($names.Count) names"
+                    return $names
+                }
+            }
         }
-    }
-    catch {
-        Write-TTDebugLog "Search-AzDoUsers vssps error: $($_.Exception.Message)"
-    }
-
-    # ── Attempt 3: Graph users (continuationToken paging) ─────────
-    $url3 = "https://vssps.dev.azure.com/$Organization/_apis/graph/users?api-version=7.1-preview.1"
-    try {
-        $r3 = Invoke-RestMethod -Uri $url3 -Method Get -Headers $headers -ErrorAction Stop
-        Write-TTDebugLog "Search-AzDoUsers graph raw count: $(if ($r3.value) { $r3.value.Count } else { 0 })"
-        if ($r3.value -and $r3.value.Count -gt 0) {
-            $lower = $SearchTerm.ToLower()
-            $names = @($r3.value |
-                Where-Object { $_.displayName -and $_.displayName.ToLower().Contains($lower) } |
-                ForEach-Object { $_.displayName })
-            Write-TTDebugLog "Search-AzDoUsers graph found $($names.Count) matching names"
-            if ($names.Count -gt 0) { return $names }
+        catch {
+            Write-TTDebugLog "Search-AzDoUsers WIQL error: $($_.Exception.Message)"
         }
-    }
-    catch {
-        Write-TTDebugLog "Search-AzDoUsers graph error: $($_.Exception.Message)"
     }
 
     Write-TTDebugLog "Search-AzDoUsers: all attempts exhausted, returning empty"

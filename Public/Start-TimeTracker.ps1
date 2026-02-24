@@ -110,13 +110,14 @@ function Start-TimeTracker {
     $selectedIndex = 0
     $scrollOffset = 0
     $statusMessage = ""
-    $mode = "list"  # list | detail | statuspicker | commentpicker | fieldpicker | toolsmenu | queryform | priform
+    $mode = "list"  # list | detail | statuspicker | assigneepicker | commentpicker | fieldpicker | toolsmenu | queryform | priform
     $detailScrollOffset = 0
     $detailData = $null
     $activeTimers = @{}          # hashtable: workItemId -> Stopwatch
     $statusPickerData = $null    # @{ Item; Statuses; SelectedIndex }
     $commentPickerData = $null   # @{ Item; Comments; SelectedIndex; Action }
     $fieldPickerData = $null     # @{ Item; Fields; SelectedIndex }
+    $assigneePickerData = $null   # @{ Item; SearchText; Results; SelectedIndex; LastSearchText }
     $toolsMenuData = $null       # @{ SelectedIndex; MenuItems }
 
     # ── Tab State ────────────────────────────────────────────────────
@@ -1011,7 +1012,120 @@ function Start-TimeTracker {
                             $mode = "fieldpicker"
                             [Console]::Clear()
                         }
+                        'N' {
+                            # Open assignee picker instantly; results load as the user types
+                            $item = $detailData.Item
+                            $assigneePickerData = @{
+                                Item           = $item
+                                SearchText     = ""
+                                Results        = @()
+                                SelectedIndex  = 0
+                                LastSearchText = ""
+                            }
+                            $mode = "assigneepicker"
+                            [Console]::Clear()
+                        }
                         default { }
+                    }
+                }
+
+                "assigneepicker" {
+                    Render-AssigneePicker -Item $assigneePickerData.Item `
+                        -SearchText $assigneePickerData.SearchText `
+                        -Results $assigneePickerData.Results `
+                        -SelectedIndex $assigneePickerData.SelectedIndex
+
+                    $key = [Console]::ReadKey($true)
+
+                    switch ($key.Key) {
+                        'Escape' {
+                            $assigneePickerData = $null
+                            $mode = "detail"
+                            [Console]::Clear()
+                        }
+                        'UpArrow' {
+                            if ($assigneePickerData.SelectedIndex -gt 0) {
+                                $assigneePickerData.SelectedIndex--
+                            }
+                        }
+                        'DownArrow' {
+                            $maxIdx = $assigneePickerData.Results.Count  # 0=Unassign, 1..Count=results
+                            if ($assigneePickerData.SelectedIndex -lt $maxIdx) {
+                                $assigneePickerData.SelectedIndex++
+                            }
+                        }
+                        'Backspace' {
+                            if ($assigneePickerData.SearchText.Length -gt 0) {
+                                $assigneePickerData.SearchText = $assigneePickerData.SearchText.Substring(
+                                    0, $assigneePickerData.SearchText.Length - 1)
+                                $assigneePickerData.SelectedIndex = 0
+                            }
+                        }
+                        'Enter' {
+                            $item = $assigneePickerData.Item
+                            $selIdx = $assigneePickerData.SelectedIndex
+
+                            if ($selIdx -eq 0) {
+                                # Unassign
+                                try {
+                                    Set-WorkItemAssignee -Organization $config.Organization `
+                                        -Project $config.Project -PAT $config.PAT `
+                                        -WorkItemId $item.Id -AssignedTo ""
+                                    $item['AssignedTo'] = $null
+                                    $statusMessage = "Assignee cleared for #$($item.Id)"
+                                }
+                                catch {
+                                    $statusMessage = "Error: $($_.Exception.Message)"
+                                }
+                            }
+                            else {
+                                # Assign to selected user
+                                $selectedUser = $assigneePickerData.Results[$selIdx - 1]
+                                try {
+                                    Set-WorkItemAssignee -Organization $config.Organization `
+                                        -Project $config.Project -PAT $config.PAT `
+                                        -WorkItemId $item.Id -AssignedTo $selectedUser
+                                    $item['AssignedTo'] = $selectedUser
+                                    $statusMessage = "#$($item.Id) assigned to '$selectedUser'"
+                                }
+                                catch {
+                                    $statusMessage = "Error: $($_.Exception.Message)"
+                                }
+                            }
+
+                            $assigneePickerData = $null
+                            $mode = "detail"
+                            [Console]::Clear()
+                        }
+                        default {
+                            if ($key.KeyChar -and -not [char]::IsControl($key.KeyChar)) {
+                                $assigneePickerData.SearchText += $key.KeyChar
+                                $assigneePickerData.SelectedIndex = 0
+                            }
+                        }
+                    }
+
+                    # Search API when text changes and meets minimum length (2+ chars)
+                    if ($null -ne $assigneePickerData) {
+                        $st = $assigneePickerData.SearchText
+                        if ($st.Length -ge 2 -and $st -ne $assigneePickerData.LastSearchText) {
+                            $assigneePickerData.Results = @(Search-AzDoUsers `
+                                -Organization $config.Organization `
+                                -PAT $config.PAT `
+                                -SearchTerm $st `
+                                -Project $config.Project)
+                            $assigneePickerData.LastSearchText = $st
+                            # Clamp SelectedIndex (0=Unassign, 1..Count=results)
+                            $maxIdx = $assigneePickerData.Results.Count
+                            if ($assigneePickerData.SelectedIndex -gt $maxIdx) {
+                                $assigneePickerData.SelectedIndex = $maxIdx
+                            }
+                        }
+                        elseif ($st.Length -lt 2 -and $assigneePickerData.Results.Count -gt 0) {
+                            $assigneePickerData.Results = @()
+                            $assigneePickerData.LastSearchText = ""
+                            $assigneePickerData.SelectedIndex = 0
+                        }
                     }
                 }
 

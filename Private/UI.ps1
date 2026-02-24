@@ -502,7 +502,7 @@ function Render-DetailView {
     $padLen = [Math]::Max(0, $width - $header.Length)
     Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkBlue
 
-    $helpLine = " [ESC] Back  [Arrows] Scroll  [s] Status  [h] Hours  [f] Edit Fields  [a] Add Comment  [e] Edit  [d] Delete "
+    $helpLine = " [ESC] Back  [Arrows] Scroll  [s] Status  [n] Assign  [h] Hours  [f] Edit Fields  [a] Add Comment  [e] Edit  [d] Delete "
     $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
     Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
 
@@ -956,6 +956,89 @@ function Render-StatusPicker {
     }
 
     $statusLine = " Choose a status "
+    $padded3 = $statusLine + (" " * [Math]::Max(0, $width - $statusLine.Length))
+    Write-Host $padded3 -ForegroundColor Gray -BackgroundColor DarkGray
+}
+
+# ── Render assignee picker ──────────────────────────────────────────
+function Render-AssigneePicker {
+    param(
+        [hashtable]$Item,
+        [string]$SearchText,
+        [array]$Results,
+        [int]$SelectedIndex   # 0 = "(Unassign)", 1..n = Results entries
+    )
+
+    [Console]::CursorVisible = $false
+    [Console]::SetCursorPosition(0, 0)
+
+    $width = [Console]::WindowWidth
+    $height = [Console]::WindowHeight
+
+    # Header
+    $header = " ASSIGN WORK ITEM "
+    $padLen = [Math]::Max(0, $width - $header.Length)
+    Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkMagenta
+
+    $helpLine = " [Type] Search  [Up/Down] Select  [Enter] Confirm  [Backspace] Delete  [ESC] Cancel "
+    $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
+    Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
+
+    $availableLines = $height - 3
+
+    $contentLines = [System.Collections.ArrayList]::new()
+    [void]$contentLines.Add("")
+    [void]$contentLines.Add("  $($Item.Type) #$($Item.Id): $($Item.Title)")
+    $currentAssignee = if ($Item.ContainsKey('AssignedTo') -and $Item.AssignedTo) { $Item.AssignedTo } else { "(unassigned)" }
+    [void]$contentLines.Add("  Current Assignee: $currentAssignee")
+    [void]$contentLines.Add("")
+    [void]$contentLines.Add("  Search: [$SearchText]_")
+    [void]$contentLines.Add("")
+    [void]$contentLines.Add("  Select new assignee:")
+    [void]$contentLines.Add("")
+
+    $optionsStartLine = $contentLines.Count
+
+    # Option 0: Unassign
+    $prefix0 = if ($SelectedIndex -eq 0) { "  > " } else { "    " }
+    [void]$contentLines.Add("$prefix0(Unassign)")
+
+    # Options 1..n: search results
+    for ($i = 0; $i -lt $Results.Count; $i++) {
+        $prefix = if (($i + 1) -eq $SelectedIndex) { "  > " } else { "    " }
+        [void]$contentLines.Add("$prefix$($Results[$i])")
+    }
+
+    # Hint when no results yet
+    if ($Results.Count -eq 0 -and $SearchText.Length -ge 2) {
+        [void]$contentLines.Add("    (no matches - try a different name)")
+    }
+    elseif ($Results.Count -eq 0 -and $SearchText.Length -eq 1) {
+        [void]$contentLines.Add("    (type one more character to search...)")
+    }
+    elseif ($Results.Count -eq 0) {
+        [void]$contentLines.Add("    (type 2+ characters to search for a user)")
+    }
+
+    for ($l = 0; $l -lt $availableLines; $l++) {
+        if ($l -lt $contentLines.Count) {
+            $lineText = $contentLines[$l]
+            $padded = $lineText + (" " * [Math]::Max(0, $width - $lineText.Length))
+            $lineOptIdx = $l - $optionsStartLine   # 0 = Unassign, 1..n = results
+            $isSelected = ($l -ge $optionsStartLine) -and ($lineOptIdx -eq $SelectedIndex)
+            if ($isSelected) {
+                Write-Host $padded -ForegroundColor White -BackgroundColor DarkCyan
+            }
+            else {
+                Write-Host $padded -ForegroundColor White
+            }
+        }
+        else {
+            Write-Host (" " * $width)
+        }
+    }
+
+    $statusLine = " Select '(Unassign)' to clear the assignee, or type 2+ chars to search "
     $padded3 = $statusLine + (" " * [Math]::Max(0, $width - $statusLine.Length))
     Write-Host $padded3 -ForegroundColor Gray -BackgroundColor DarkGray
 }
