@@ -282,14 +282,12 @@ function Render-WorkItemList {
                     $timeStr = " [$cw/$rw]"
                 }
 
-                $stateStr = " ($($item.State))"
-
                 $prefix = "  "
                 if ($idx -eq $SelectedIndex) {
                     $prefix = "> "
                 }
 
-                $lineText = "$prefix$indent$icon $($item.Id): $($item.Title)$stateStr$timeStr$timerStr"
+                $lineText = "$prefix$indent$icon $($item.Id)/$($item.State): $($item.Title)$timeStr$timerStr"
 
                 $padded = Format-FixedWidth -Text $lineText -Width $width
 
