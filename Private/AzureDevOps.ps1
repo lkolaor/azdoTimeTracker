@@ -244,6 +244,8 @@ function Build-WorkItemTree {
             CompletedWork   = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.CompletedWork'
             RemainingWork   = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.RemainingWork'
             IsMine          = $true
+            IsSeparator     = $false
+            IsRelated       = $false
             Depth           = 0
             Children        = @()
             Raw             = $item
@@ -268,6 +270,8 @@ function Build-WorkItemTree {
                 CompletedWork   = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.CompletedWork'
                 RemainingWork   = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.RemainingWork'
                 IsMine          = $false
+                IsSeparator     = $false
+                IsRelated       = $false
                 Depth           = 0
                 Children        = @()
                 Raw             = $item
@@ -816,6 +820,8 @@ function ConvertTo-FlatWorkItem {
         CompletedWork    = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.CompletedWork'
         RemainingWork    = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.RemainingWork'
         IsMine           = $true
+        IsSeparator      = $false
+        IsRelated        = $false
         Depth            = 0
         Children         = @()
         Raw              = $RawItem
@@ -1175,4 +1181,179 @@ function Search-WorkItemsByFilters {
 
     $ids = @($result.workItems | ForEach-Object { $_.id } | Select-Object -First 200)
     return @(Get-WorkItemDetailsFromIds -Organization $Organization -Project $Project -PAT $PAT -Ids $ids)
+}
+
+# ── Get children and related items for a parent work item (Pri tab) ─
+function Get-PriWorkItems {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT,
+        [int]$ParentId,
+        [switch]$IncludeClosed
+    )
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $baseUrl = "https://dev.azure.com/$Organization/$Project/_apis"
+    $wiqlUrl = "$baseUrl/wit/wiql?api-version=7.1"
+
+    # ── 1. Fetch parent with $expand=all to get its relations ─────
+    $parentUrl = "https://dev.azure.com/$Organization/$Project/_apis/wit/workitems/${ParentId}?`$expand=all&api-version=7.1"
+    $parentRaw = $null
+    try {
+        $parentRaw = Invoke-RestMethod -Uri $parentUrl -Method Get -Headers $headers -ErrorAction Stop
+    }
+    catch {
+        Write-TTDebugLog "Get-PriWorkItems: error fetching parent $ParentId : $($_.Exception.Message)"
+        return @()
+    }
+
+    # ── 2. WIQL recursive query for all descendants ───────────────
+    $wiqlDescendants = @{
+        query = @"
+SELECT [System.Id]
+FROM WorkItemLinks
+WHERE [Source].[System.Id] = $ParentId
+  AND [System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward'
+  AND [Target].[System.TeamProject] = @project
+  AND [Target].[System.State] <> 'Removed'
+MODE (Recursive)
+"@
+    } | ConvertTo-Json
+
+    # linkParentMap: child-id -> direct-parent-id
+    $linkParentMap = @{}
+    $descendantIds = [System.Collections.ArrayList]::new()
+
+    try {
+        $wiqlResult = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers `
+            -ContentType "application/json" -Body $wiqlDescendants -ErrorAction Stop
+
+        foreach ($link in $wiqlResult.workItemRelations) {
+            if ($null -eq $link.target) { continue }
+            $targetId = $link.target.id
+            if ($targetId -eq $ParentId) { continue }
+            $sourceId = if ($null -ne $link.source) { $link.source.id } else { $ParentId }
+            $linkParentMap[$targetId] = $sourceId
+            if (-not $descendantIds.Contains($targetId)) {
+                [void]$descendantIds.Add($targetId)
+            }
+        }
+    }
+    catch {
+        Write-TTDebugLog "Get-PriWorkItems: WIQL descendants error: $($_.Exception.Message)"
+    }
+
+    # ── 3. Collect related/dependency IDs from parent's relations ──
+    $relatedIds = [System.Collections.ArrayList]::new()
+    if ($parentRaw.relations) {
+        foreach ($rel in $parentRaw.relations) {
+            $relType = $rel.rel
+            if ($rel.url -match '/workitems/(\d+)') {
+                $wiId = [int]$Matches[1]
+                if ($wiId -eq $ParentId) { continue }
+                if ($relType -in @(
+                        'System.LinkTypes.Related',
+                        'System.LinkTypes.Dependency-Forward',
+                        'System.LinkTypes.Dependency-Reverse',
+                        'Microsoft.VSTS.Common.Affects-Forward',
+                        'Microsoft.VSTS.Common.Affects-Reverse'
+                    ) -and -not $descendantIds.Contains($wiId)) {
+                    [void]$relatedIds.Add($wiId)
+                }
+            }
+        }
+    }
+
+    # ── 4. Build depth map iteratively ────────────────────────────
+    $depthMap = @{ [int]$ParentId = 0 }
+    $iterations = 0
+    $maxIter = 20
+    $depthChanged = $true
+    while ($depthChanged -and $iterations -lt $maxIter) {
+        $depthChanged = $false
+        $iterations++
+        foreach ($childId in @($linkParentMap.Keys)) {
+            if ($depthMap.ContainsKey([int]$childId)) { continue }
+            $parentOfChild = $linkParentMap[$childId]
+            if ($depthMap.ContainsKey([int]$parentOfChild)) {
+                $depthMap[[int]$childId] = $depthMap[[int]$parentOfChild] + 1
+                $depthChanged = $true
+            }
+        }
+    }
+
+    # ── 5. Build result list ──────────────────────────────────────
+    $resultList = [System.Collections.ArrayList]::new()
+
+    # Parent at depth 0
+    $parentItem = ConvertTo-FlatWorkItem -RawItem $parentRaw
+    $parentItem['Depth'] = 0
+    [void]$resultList.Add($parentItem)
+
+    # Closed states to exclude when $IncludeClosed is $false
+    $closedStates = @('Closed', 'Done', 'Released', 'Removed')
+
+    # Descendants in WIQL traversal order (preserves tree structure)
+    if ($descendantIds.Count -gt 0) {
+        $descItems = @(Get-WorkItemDetailsFromIds -Organization $Organization `
+            -Project $Project -PAT $PAT -Ids @($descendantIds))
+
+        # Filter out closed items unless IncludeClosed is set
+        if (-not $IncludeClosed) {
+            $descItems = @($descItems | Where-Object { $closedStates -notcontains $_.State })
+        }
+
+        # Build id->item map for sorted insertion
+        $itemById = @{}
+        foreach ($di in $descItems) { $itemById[[int]$di.Id] = $di }
+
+        foreach ($dId in $descendantIds) {
+            $di = $itemById[[int]$dId]
+            if ($null -eq $di) { continue }
+            $depth = if ($depthMap.ContainsKey([int]$dId)) { $depthMap[[int]$dId] } else { 1 }
+            $di['Depth'] = $depth
+            [void]$resultList.Add($di)
+        }
+    }
+
+    # Related items section
+    if ($relatedIds.Count -gt 0) {
+        $uniqueRelated = @($relatedIds | Select-Object -Unique)
+        $relItems = @(Get-WorkItemDetailsFromIds -Organization $Organization `
+            -Project $Project -PAT $PAT -Ids $uniqueRelated)
+
+        # Filter out closed related items unless IncludeClosed is set
+        if (-not $IncludeClosed) {
+            $relItems = @($relItems | Where-Object { $closedStates -notcontains $_.State })
+        }
+
+        if ($relItems.Count -gt 0) {
+            [void]$resultList.Add(@{
+                Id               = $null
+                Title            = "--- Related ---"
+                Type             = "__separator__"
+                State            = ""
+                AssignedTo       = ""
+                ParentId         = $null
+                OriginalEstimate = $null
+                CompletedWork    = $null
+                RemainingWork    = $null
+                Depth            = 0
+                IsMine           = $false
+                IsSeparator      = $true
+                IsRelated        = $false
+                Children         = @()
+                Raw              = $null
+            })
+
+            foreach ($ri in $relItems) {
+                $ri['Depth'] = 0
+                $ri['IsRelated'] = $true
+                [void]$resultList.Add($ri)
+            }
+        }
+    }
+
+    return $resultList
 }

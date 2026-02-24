@@ -54,7 +54,7 @@ function Start-TimeTracker {
 
     # ── Fetch work items ─────────────────────────────────────────────
     function Refresh-TabItems {
-        param($Config, [int]$TabIndex = 0, [bool]$ShowAll = $false)
+        param($Config, [int]$TabIndex = 0, [bool]$ShowAll = $false, $PriData = $null)
 
         switch ($TabIndex) {
             0 {
@@ -90,6 +90,17 @@ function Start-TimeTracker {
             4 {
                 return [System.Collections.ArrayList]::new()
             }
+            5 {
+                if ($PriData -and $PriData.HasParent) {
+                    return [System.Collections.ArrayList]@(
+                        Get-PriWorkItems -Organization $Config.Organization `
+                            -Project $Config.Project -PAT $Config.PAT `
+                            -ParentId $PriData.ParentId `
+                            -IncludeClosed:$ShowAll
+                    )
+                }
+                return [System.Collections.ArrayList]::new()
+            }
         }
     }
 
@@ -99,7 +110,7 @@ function Start-TimeTracker {
     $selectedIndex = 0
     $scrollOffset = 0
     $statusMessage = ""
-    $mode = "list"  # list | detail | statuspicker | commentpicker | fieldpicker | toolsmenu | queryform
+    $mode = "list"  # list | detail | statuspicker | commentpicker | fieldpicker | toolsmenu | queryform | priform
     $detailScrollOffset = 0
     $detailData = $null
     $activeTimers = @{}          # hashtable: workItemId -> Stopwatch
@@ -109,7 +120,7 @@ function Start-TimeTracker {
     $toolsMenuData = $null       # @{ SelectedIndex; MenuItems }
 
     # ── Tab State ────────────────────────────────────────────────────
-    $tabNames = @("Mine", "Mentions", "Following", "Created by me", "Query")
+    $tabNames = @("Mine", "Mentions", "Following", "Created by me", "Query", "Pri")
     $activeTab = 0
     $tabState = @(
         @{ Items = $items; SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $true;  EmptyMessage = "No work items found assigned to you." }
@@ -117,6 +128,7 @@ function Start-TimeTracker {
         @{ Items = $null;  SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $false; EmptyMessage = "No followed work items." }
         @{ Items = $null;  SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $false; EmptyMessage = "No work items created by you." }
         @{ Items = $null;  SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $true;  EmptyMessage = "Press / to search for work items." }
+        @{ Items = $null;  SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $false; EmptyMessage = "No parent selected. Press / to set a parent work item." }
     )
     $queryData = @{
         TitleContains     = ""
@@ -126,6 +138,37 @@ function Start-TimeTracker {
         WorkItemId        = ""
         FormSelectedIndex = 0
         HasSearched       = $false
+    }
+    $priData = @{
+        ParentId          = 0
+        ParentTitle       = ""
+        HasParent         = $false
+        SearchInput       = ""
+        SearchResults     = @()
+        SearchResultIndex = 0
+        FormState         = "input"   # "input" or "results"
+    }
+
+    # Load persisted Pri parent from config (use PSObject.Properties to avoid StrictMode errors on old configs)
+    $savedParentId = 0
+    $savedParentTitle = ""
+    $priParentIdProp = $config.PSObject.Properties['PriParentId']
+    if ($null -ne $priParentIdProp -and $null -ne $priParentIdProp.Value) {
+        $parsedId = 0
+        if ([int]::TryParse([string]$priParentIdProp.Value, [ref]$parsedId) -and $parsedId -gt 0) {
+            $savedParentId = $parsedId
+        }
+    }
+    $priParentTitleProp = $config.PSObject.Properties['PriParentTitle']
+    if ($null -ne $priParentTitleProp -and $priParentTitleProp.Value) {
+        $savedParentTitle = [string]$priParentTitleProp.Value
+    }
+    if ($savedParentId -gt 0) {
+        $priData.ParentId    = $savedParentId
+        $priData.ParentTitle = if ($savedParentTitle) { $savedParentTitle } else { "#$savedParentId" }
+        $priData.HasParent   = $true
+        $tabState[5].Loaded  = $false   # will load on first visit to tab
+        $tabState[5].EmptyMessage = "No children or related items found for #$savedParentId."
     }
 
     # ── Save a single timer ──────────────────────────────────────────
@@ -208,8 +251,8 @@ function Start-TimeTracker {
 
     try {
         while ($true) {
-            # Always work with a filtered list of valid items
-            $validItems = @($items | Where-Object { $_.Id -and $_.Title })
+            # Always work with a filtered list of valid items (include separator rows)
+            $validItems = @($items | Where-Object { ($_.Id -and $_.Title) -or $_.IsSeparator })
 
             # Ensure selectedIndex is always valid for the filtered list
             if ($selectedIndex -lt 0) { $selectedIndex = 0 }
@@ -224,7 +267,7 @@ function Start-TimeTracker {
                         -StatusMessage $statusMessage -ActiveTimers $activeTimers `
                         -TabNames $tabNames -ActiveTabIndex $activeTab `
                         -ShowAllEnabled $tabState[$activeTab].ShowAll `
-                        -ShowAllAvailable ($activeTab -in 1, 2, 3) `
+                        -ShowAllAvailable ($activeTab -in 1, 2, 3, 5) `
                         -NoItemsMessage $tabState[$activeTab].EmptyMessage
                     $statusMessage = ""
 
@@ -244,10 +287,18 @@ function Start-TimeTracker {
 
                     switch ($key.Key) {
                         'UpArrow' {
-                            if ($selectedIndex -gt 0) { $selectedIndex-- }
+                            if ($selectedIndex -gt 0) {
+                                $selectedIndex--
+                                # Skip separator rows
+                                while ($selectedIndex -gt 0 -and $validItems[$selectedIndex].IsSeparator) { $selectedIndex-- }
+                            }
                         }
                         'DownArrow' {
-                            if ($selectedIndex -lt ($validItems.Count - 1)) { $selectedIndex++ }
+                            if ($selectedIndex -lt ($validItems.Count - 1)) {
+                                $selectedIndex++
+                                # Skip separator rows
+                                while ($selectedIndex -lt ($validItems.Count - 1) -and $validItems[$selectedIndex].IsSeparator) { $selectedIndex++ }
+                            }
                         }
                         'PageUp' {
                             $pageSize = [Console]::WindowHeight - 4
@@ -264,7 +315,29 @@ function Start-TimeTracker {
                             $selectedIndex = $validItems.Count - 1
                         }
                         'R' {
-                            if ($activeTab -eq 4 -and $queryData.HasSearched) {
+                            if ($activeTab -eq 5 -and $priData.HasParent) {
+                                # Refresh Pri tab - reload children/related for saved parent
+                                [Console]::Clear()
+                                Write-Host "`n  Refreshing items for parent #$($priData.ParentId)..." -ForegroundColor Cyan
+                                $items = [System.Collections.ArrayList]@(
+                                    Get-PriWorkItems -Organization $config.Organization `
+                                        -Project $config.Project -PAT $config.PAT `
+                                        -ParentId $priData.ParentId `
+                                        -IncludeClosed:$tabState[5].ShowAll
+                                )
+                                $tabState[5].Items = $items
+                                $tabState[5].Loaded = $true
+                                $selectedIndex = 0
+                                $scrollOffset = 0
+                                $statusMessage = "Refreshed - $($items.Count) items"
+                                [Console]::Clear()
+                            }
+                            elseif ($activeTab -eq 5) {
+                                # No parent set, open priform
+                                $mode = "priform"
+                                [Console]::Clear()
+                            }
+                            elseif ($activeTab -eq 4 -and $queryData.HasSearched) {
                                 # Re-run last search on Query tab
                                 [Console]::Clear()
                                 Write-Host "`n  Re-running search..." -ForegroundColor Cyan
@@ -293,10 +366,10 @@ function Start-TimeTracker {
                             else {
                                 $statusMessage = "Refreshing..."
                                 $prevSelectedId = if ($validItems.Count -gt 0) { $validItems[$selectedIndex].Id } else { $null }
-                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
                                 $tabState[$activeTab].Items = $items
                                 $tabState[$activeTab].Loaded = $true
-                                $validItems = @($items | Where-Object { $_.Id -and $_.Title })
+                                $validItems = @($items | Where-Object { ($_.Id -and $_.Title) -or $_.IsSeparator })
                                 $selectedIndex = 0
                                 if ($prevSelectedId) {
                                     for ($i = 0; $i -lt $validItems.Count; $i++) {
@@ -315,6 +388,7 @@ function Start-TimeTracker {
                             # Show detail view
                             if ($validItems.Count -gt 0) {
                                 $item = $validItems[$selectedIndex]
+                                if ($item.IsSeparator) { break }  # Don't open separator items
                                 [Console]::Clear()
 
                                 $detail = Get-WorkItemDetail -Organization $config.Organization `
@@ -359,6 +433,7 @@ function Start-TimeTracker {
                             # Toggle time tracking on selected item
                             if ($validItems.Count -gt 0) {
                                 $item = $validItems[$selectedIndex]
+                                if ($item.IsSeparator) { break }  # Can't track time on separator
                                 $itemId = $item.Id
 
                                 if ($activeTimers.ContainsKey($itemId)) {
@@ -399,6 +474,8 @@ function Start-TimeTracker {
                                                 CompletedWork    = $null
                                                 RemainingWork    = 5.0
                                                 IsMine           = $true
+                                                IsSeparator      = $false
+                                                IsRelated        = $false
                                                 Depth            = $item.Depth + 1
                                                 Children         = @()
                                                 Raw              = $newWI
@@ -538,6 +615,16 @@ function Start-TimeTracker {
                                 $statusMessage = if ($tabState[$activeTab].ShowAll) { "Showing all items (including closed)" } else { "Showing active items only" }
                                 [Console]::Clear()
                             }
+                            elseif ($activeTab -eq 5 -and $priData.HasParent) {
+                                $tabState[5].ShowAll = -not $tabState[5].ShowAll
+                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex 5 -ShowAll $tabState[5].ShowAll -PriData $priData)
+                                $tabState[5].Items = $items
+                                $tabState[5].Loaded = $true
+                                $selectedIndex = 0
+                                $scrollOffset = 0
+                                $statusMessage = if ($tabState[5].ShowAll) { "Showing all items (including closed)" } else { "Showing active items only" }
+                                [Console]::Clear()
+                            }
                         }
                         'Tab' {
                             # Tab / Shift+Tab to cycle through tabs
@@ -555,7 +642,7 @@ function Start-TimeTracker {
                             $activeTab = $newTab
 
                             if (-not $tabState[$activeTab].Loaded) {
-                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
                                 $tabState[$activeTab].Items = $items
                                 $tabState[$activeTab].Loaded = $true
                             }
@@ -570,13 +657,16 @@ function Start-TimeTracker {
                             if ($activeTab -eq 4 -and (-not $queryData.HasSearched)) {
                                 $mode = "queryform"
                             }
+                            elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
+                                $mode = "priform"
+                            }
 
                             [Console]::Clear()
                         }
                         default {
-                            # Check for tab switching (digit keys 1-5) and '/' for query
+                            # Check for tab switching (digit keys 1-6) and '/' for query/pri
                             $keyChar = $key.KeyChar
-                            if ($keyChar -ge '1' -and $keyChar -le '5') {
+                            if ($keyChar -ge '1' -and $keyChar -le '6') {
                                 $newTab = [int]::Parse($keyChar.ToString()) - 1
                                 if ($newTab -ne $activeTab -and $newTab -lt $tabNames.Count) {
                                     # Save current tab state
@@ -588,7 +678,7 @@ function Start-TimeTracker {
 
                                     # Load tab if needed
                                     if (-not $tabState[$activeTab].Loaded) {
-                                        $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                        $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
                                         $tabState[$activeTab].Items = $items
                                         $tabState[$activeTab].Loaded = $true
                                     }
@@ -600,9 +690,12 @@ function Start-TimeTracker {
                                     $selectedIndex = $tabState[$activeTab].SelectedIndex
                                     $scrollOffset = $tabState[$activeTab].ScrollOffset
 
-                                    # For Query tab with no results yet, auto-open form
+                                    # Auto-open form for Query/Pri tabs with no data yet
                                     if ($activeTab -eq 4 -and (-not $queryData.HasSearched)) {
                                         $mode = "queryform"
+                                    }
+                                    elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
+                                        $mode = "priform"
                                     }
 
                                     [Console]::Clear()
@@ -610,6 +703,11 @@ function Start-TimeTracker {
                             }
                             elseif ($keyChar -eq '/' -and $activeTab -eq 4) {
                                 $mode = "queryform"
+                                [Console]::Clear()
+                            }
+                            elseif ($keyChar -eq '/' -and $activeTab -eq 5) {
+                                $priData.FormState = 'input'
+                                $mode = "priform"
                                 [Console]::Clear()
                             }
                         }
@@ -1128,7 +1226,13 @@ function Start-TimeTracker {
                                         $tabState[$ti].ScrollOffset = 0
                                     }
                                     $queryData.HasSearched = $false
-                                    $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                    $priData.HasParent  = $false
+                                    $priData.ParentId   = 0
+                                    $priData.ParentTitle = ""
+                                    $priData.SearchInput = ""
+                                    $priData.SearchResults = @()
+                                    $priData.FormState = "input"
+                                    $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
                                     $tabState[$activeTab].Items = $items
                                     $tabState[$activeTab].Loaded = $true
                                     $validItems = @($items | Where-Object { $_.Id -and $_.Title })
@@ -1395,7 +1499,7 @@ function Start-TimeTracker {
                             $activeTab = $newTab
 
                             if (-not $tabState[$activeTab].Loaded) {
-                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
                                 $tabState[$activeTab].Items = $items
                                 $tabState[$activeTab].Loaded = $true
                             }
@@ -1410,6 +1514,9 @@ function Start-TimeTracker {
                             if ($activeTab -eq 4 -and (-not $queryData.HasSearched)) {
                                 $mode = "queryform"
                             }
+                            elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
+                                $mode = "priform"
+                            }
                             else {
                                 $mode = "list"
                             }
@@ -1417,9 +1524,9 @@ function Start-TimeTracker {
                             [Console]::Clear()
                         }
                         default {
-                            # Check for tab switching (digit keys 1-5)
+                            # Check for tab switching (digit keys 1-6)
                             $keyChar = $key.KeyChar
-                            if ($keyChar -ge '1' -and $keyChar -le '5') {
+                            if ($keyChar -ge '1' -and $keyChar -le '6') {
                                 $newTab = [int]::Parse($keyChar.ToString()) - 1
                                 if ($newTab -ne $activeTab -and $newTab -lt $tabNames.Count) {
                                     $tabState[$activeTab].SelectedIndex = $selectedIndex
@@ -1429,7 +1536,7 @@ function Start-TimeTracker {
                                     $activeTab = $newTab
 
                                     if (-not $tabState[$activeTab].Loaded) {
-                                        $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll)
+                                        $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
                                         $tabState[$activeTab].Items = $items
                                         $tabState[$activeTab].Loaded = $true
                                     }
@@ -1444,12 +1551,255 @@ function Start-TimeTracker {
                                     if ($activeTab -eq 4 -and (-not $queryData.HasSearched)) {
                                         $mode = "queryform"
                                     }
+                                    elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
+                                        $mode = "priform"
+                                    }
                                     else {
                                         $mode = "list"
                                     }
 
                                     [Console]::Clear()
                                 }
+                            }
+                        }
+                    }
+                }
+                "priform" {
+                    Render-PriSearchForm -PriData $priData `
+                        -TabNames $tabNames -ActiveTabIndex $activeTab `
+                        -StatusMessage $statusMessage
+                    $statusMessage = ""
+
+                    $key = [Console]::ReadKey($true)
+
+                    switch ($key.Key) {
+                        'Escape' {
+                            if ($priData.FormState -eq 'results') {
+                                $priData.FormState = 'input'
+                                $priData.SearchResults = @()
+                                $priData.SearchResultIndex = 0
+                            }
+                            elseif ($priData.HasParent) {
+                                $mode = 'list'
+                                [Console]::Clear()
+                            }
+                            # else stay in form (no parent yet, can't go back to list)
+                        }
+                        'UpArrow' {
+                            if ($priData.FormState -eq 'results' -and $priData.SearchResultIndex -gt 0) {
+                                $priData.SearchResultIndex--
+                            }
+                        }
+                        'DownArrow' {
+                            if ($priData.FormState -eq 'results') {
+                                $maxIdx = [Math]::Max(0, $priData.SearchResults.Count - 1)
+                                if ($priData.SearchResultIndex -lt $maxIdx) {
+                                    $priData.SearchResultIndex++
+                                }
+                            }
+                        }
+                        'Enter' {
+                            if ($priData.FormState -eq 'results') {
+                                # Select highlighted result as parent
+                                $selectedParent = $priData.SearchResults[$priData.SearchResultIndex]
+                                $priData.ParentId    = $selectedParent.Id
+                                $priData.ParentTitle = $selectedParent.Title
+                                $priData.HasParent   = $true
+                                Save-PriParentConfig -ParentId $priData.ParentId -ParentTitle $priData.ParentTitle
+                                $priData.FormState   = 'input'
+                                $priData.SearchInput = ''
+                                $priData.SearchResults = @()
+                                $priData.SearchResultIndex = 0
+
+                                [Console]::Clear()
+                                Write-Host "`n  Loading items for parent #$($priData.ParentId)..." -ForegroundColor Cyan
+                                $tabState[5].EmptyMessage = "No children or related items found for #$($priData.ParentId)."
+                                $items = [System.Collections.ArrayList]@(
+                                    Get-PriWorkItems -Organization $config.Organization `
+                                        -Project $config.Project -PAT $config.PAT `
+                                        -ParentId $priData.ParentId `
+                                        -IncludeClosed:$tabState[5].ShowAll
+                                )
+                                $tabState[5].Items  = $items
+                                $tabState[5].Loaded = $true
+                                $selectedIndex = 0
+                                $scrollOffset  = 0
+                                $statusMessage = "Loaded $($items.Count) item(s) for parent #$($priData.ParentId)"
+                                $mode = 'list'
+                                [Console]::Clear()
+                            }
+                            else {
+                                # 'input' state: search or fetch by ID
+                                $searchInput = $priData.SearchInput.Trim()
+                                if ($searchInput -eq '') {
+                                    $statusMessage = 'Please enter a work item ID or title to search'
+                                }
+                                elseif ($searchInput -match '^\d+$') {
+                                    # Fetch by ID directly
+                                    [Console]::Clear()
+                                    Write-Host "`n  Fetching work item #$searchInput..." -ForegroundColor Cyan
+                                    $parentDetail = Get-WorkItemDetail -Organization $config.Organization `
+                                        -Project $config.Project -PAT $config.PAT -WorkItemId ([int]$searchInput)
+                                    if ($parentDetail) {
+                                        $priData.ParentId    = [int]$searchInput
+                                        $priData.ParentTitle = $parentDetail.fields.'System.Title'
+                                        $priData.HasParent   = $true
+                                        Save-PriParentConfig -ParentId $priData.ParentId -ParentTitle $priData.ParentTitle
+                                        $priData.SearchInput = ''
+
+                                        [Console]::Clear()
+                                        Write-Host "`n  Loading items for parent #$($priData.ParentId)..." -ForegroundColor Cyan
+                                        $tabState[5].EmptyMessage = "No children or related items found for #$($priData.ParentId)."
+                                        $items = [System.Collections.ArrayList]@(
+                                            Get-PriWorkItems -Organization $config.Organization `
+                                                -Project $config.Project -PAT $config.PAT `
+                                                -ParentId $priData.ParentId `
+                                                -IncludeClosed:$tabState[5].ShowAll
+                                        )
+                                        $tabState[5].Items  = $items
+                                        $tabState[5].Loaded = $true
+                                        $selectedIndex = 0
+                                        $scrollOffset  = 0
+                                        $statusMessage = "Loaded $($items.Count) item(s) for parent #$($priData.ParentId)"
+                                        $mode = 'list'
+                                        [Console]::Clear()
+                                    }
+                                    else {
+                                        $statusMessage = "Work item #$searchInput not found"
+                                        [Console]::Clear()
+                                    }
+                                }
+                                else {
+                                    # Search by title
+                                    [Console]::Clear()
+                                    Write-Host "`n  Searching for '$searchInput'..." -ForegroundColor Cyan
+                                    $searchResults = @(Search-WorkItemsByFilters `
+                                        -Organization $config.Organization `
+                                        -Project $config.Project -PAT $config.PAT `
+                                        -TitleContains $searchInput)
+                                    if ($searchResults.Count -eq 0) {
+                                        $statusMessage = "No items found matching '$searchInput'"
+                                        [Console]::Clear()
+                                    }
+                                    elseif ($searchResults.Count -eq 1) {
+                                        # Auto-select the single match
+                                        $priData.ParentId    = $searchResults[0].Id
+                                        $priData.ParentTitle = $searchResults[0].Title
+                                        $priData.HasParent   = $true
+                                        Save-PriParentConfig -ParentId $priData.ParentId -ParentTitle $priData.ParentTitle
+                                        $priData.SearchInput = ''
+
+                                        [Console]::Clear()
+                                        Write-Host "`n  Loading items for parent #$($priData.ParentId)..." -ForegroundColor Cyan
+                                        $tabState[5].EmptyMessage = "No children or related items found for #$($priData.ParentId)."
+                                        $items = [System.Collections.ArrayList]@(
+                                            Get-PriWorkItems -Organization $config.Organization `
+                                                -Project $config.Project -PAT $config.PAT `
+                                                -ParentId $priData.ParentId `
+                                                -IncludeClosed:$tabState[5].ShowAll
+                                        )
+                                        $tabState[5].Items  = $items
+                                        $tabState[5].Loaded = $true
+                                        $selectedIndex = 0
+                                        $scrollOffset  = 0
+                                        $statusMessage = "Loaded $($items.Count) item(s) for parent #$($priData.ParentId)"
+                                        $mode = 'list'
+                                        [Console]::Clear()
+                                    }
+                                    else {
+                                        # Show results to pick from
+                                        $priData.SearchResults     = $searchResults
+                                        $priData.SearchResultIndex = 0
+                                        $priData.FormState         = 'results'
+                                        $statusMessage = "Found $($searchResults.Count) items - select a parent"
+                                        [Console]::Clear()
+                                    }
+                                }
+                            }
+                        }
+                        'Backspace' {
+                            if ($priData.FormState -eq 'input' -and $priData.SearchInput.Length -gt 0) {
+                                $priData.SearchInput = $priData.SearchInput.Substring(0, $priData.SearchInput.Length - 1)
+                            }
+                        }
+                        'Tab' {
+                            # Tab / Shift+Tab to cycle through tabs
+                            if ($key.Modifiers -band [ConsoleModifiers]::Shift) {
+                                $newTab = if ($activeTab -eq 0) { $tabNames.Count - 1 } else { $activeTab - 1 }
+                            }
+                            else {
+                                $newTab = if ($activeTab -eq ($tabNames.Count - 1)) { 0 } else { $activeTab + 1 }
+                            }
+                            $tabState[$activeTab].SelectedIndex = $selectedIndex
+                            $tabState[$activeTab].ScrollOffset  = $scrollOffset
+                            $tabState[$activeTab].Items         = $items
+
+                            $activeTab = $newTab
+
+                            if (-not $tabState[$activeTab].Loaded) {
+                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
+                                $tabState[$activeTab].Items  = $items
+                                $tabState[$activeTab].Loaded = $true
+                            }
+                            else {
+                                $items = $tabState[$activeTab].Items
+                                if (-not $items) { $items = [System.Collections.ArrayList]::new() }
+                            }
+
+                            $selectedIndex = $tabState[$activeTab].SelectedIndex
+                            $scrollOffset  = $tabState[$activeTab].ScrollOffset
+
+                            if ($activeTab -eq 4 -and (-not $queryData.HasSearched)) {
+                                $mode = 'queryform'
+                            }
+                            elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
+                                $mode = 'priform'
+                            }
+                            else {
+                                $mode = 'list'
+                            }
+                            [Console]::Clear()
+                        }
+                        default {
+                            # Digit keys 1-6 switch tabs
+                            $keyChar = $key.KeyChar
+                            if ($keyChar -ge '1' -and $keyChar -le '6') {
+                                $newTab = [int]::Parse($keyChar.ToString()) - 1
+                                if ($newTab -ne $activeTab -and $newTab -lt $tabNames.Count) {
+                                    $tabState[$activeTab].SelectedIndex = $selectedIndex
+                                    $tabState[$activeTab].ScrollOffset  = $scrollOffset
+                                    $tabState[$activeTab].Items         = $items
+
+                                    $activeTab = $newTab
+
+                                    if (-not $tabState[$activeTab].Loaded) {
+                                        $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
+                                        $tabState[$activeTab].Items  = $items
+                                        $tabState[$activeTab].Loaded = $true
+                                    }
+                                    else {
+                                        $items = $tabState[$activeTab].Items
+                                        if (-not $items) { $items = [System.Collections.ArrayList]::new() }
+                                    }
+
+                                    $selectedIndex = $tabState[$activeTab].SelectedIndex
+                                    $scrollOffset  = $tabState[$activeTab].ScrollOffset
+
+                                    if ($activeTab -eq 4 -and (-not $queryData.HasSearched)) {
+                                        $mode = 'queryform'
+                                    }
+                                    elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
+                                        $mode = 'priform'
+                                    }
+                                    else {
+                                        $mode = 'list'
+                                    }
+                                    [Console]::Clear()
+                                }
+                            }
+                            elseif ($priData.FormState -eq 'input' -and $key.KeyChar -and -not [char]::IsControl($key.KeyChar)) {
+                                # Append character to search input
+                                $priData.SearchInput += $key.KeyChar
                             }
                         }
                     }

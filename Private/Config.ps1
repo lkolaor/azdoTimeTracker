@@ -36,7 +36,9 @@ function Save-TTConfig {
     param(
         [string]$Organization,
         [string]$Project,
-        [string]$PAT
+        [string]$PAT,
+        [int]$PriParentId = 0,
+        [string]$PriParentTitle = ""
     )
 
     $configDir = Get-TTConfigDir
@@ -45,13 +47,28 @@ function Save-TTConfig {
     }
 
     $config = @{
-        Organization = $Organization
-        Project      = $Project
-        PAT          = $PAT
+        Organization   = $Organization
+        Project        = $Project
+        PAT            = $PAT
+        PriParentId    = $PriParentId
+        PriParentTitle = $PriParentTitle
     }
     $configPath = Get-TTConfigPath
     $config | ConvertTo-Json | Set-Content $configPath
     return $config
+}
+
+function Save-PriParentConfig {
+    param(
+        [int]$ParentId,
+        [string]$ParentTitle
+    )
+    $existing = Get-TTConfig
+    $org   = if ($existing -and $existing.Organization) { $existing.Organization } else { "" }
+    $proj  = if ($existing -and $existing.Project)      { $existing.Project      } else { "" }
+    $pat   = if ($existing -and $existing.PAT)          { $existing.PAT          } else { "" }
+    Save-TTConfig -Organization $org -Project $proj -PAT $pat `
+        -PriParentId $ParentId -PriParentTitle $ParentTitle | Out-Null
 }
 
 function Initialize-TTConfig {
@@ -101,7 +118,11 @@ function Request-TTConfig {
         exit 1
     }
 
-    $config = Save-TTConfig -Organization $org -Project $proj -PAT $pat
+    $existingParentId    = if ($existing -and $existing.PriParentId)    { [int]$existing.PriParentId    } else { 0  }
+    $existingParentTitle = if ($existing -and $existing.PriParentTitle) { [string]$existing.PriParentTitle } else { "" }
+
+    $config = Save-TTConfig -Organization $org -Project $proj -PAT $pat `
+        -PriParentId $existingParentId -PriParentTitle $existingParentTitle
     Write-Host "Configuration saved to: $(Get-TTConfigPath)" -ForegroundColor Green
     Write-Host ""
     return $config

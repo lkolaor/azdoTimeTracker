@@ -227,6 +227,7 @@ function Render-WorkItemList {
         $helpParts += if ($ShowAllEnabled) { "  [x] Active only" } else { "  [x] Show all" }
     }
     if ($ActiveTabIndex -eq 4) { $helpParts += "  [/] Search" }
+    if ($ActiveTabIndex -eq 5) { $helpParts += "  [/] Set Parent" }
     if ($TabNames.Count -gt 0) { $helpParts += "  [Tab] Switch tab" }
     $helpParts += "  [q] Quit "
     $helpLine = $helpParts
@@ -246,8 +247,8 @@ function Render-WorkItemList {
         }
     }
     else {
-        # Filter out any items missing Id or Title
-        $validItems = $Items | Where-Object { $_.Id -and $_.Title }
+        # Filter out any items missing Id or Title (but keep separator rows)
+        $validItems = $Items | Where-Object { ($_.Id -and $_.Title) -or $_.IsSeparator }
         # Adjust scroll offset so selected item is visible and valid
         if ($SelectedIndex -lt $ScrollOffset) {
             $ScrollOffset = $SelectedIndex
@@ -261,6 +262,15 @@ function Render-WorkItemList {
             $idx = $ScrollOffset + $line
             if ($idx -lt $validItems.Count) {
                 $item = $validItems[$idx]
+
+                # Render separator rows as dimmed section headers
+                if ($item.IsSeparator) {
+                    $sepLine = "  $($item.Title)"
+                    Write-Host (Format-FixedWidth -Text $sepLine -Width $width) -ForegroundColor DarkYellow
+                    $rendered++
+                    continue
+                }
+
                 $indent = "  " * $item.Depth
                 $icon = Get-TypeIcon -Type $item.Type
                 $typeColor = Get-TypeColor -Type $item.Type
@@ -301,6 +311,9 @@ function Render-WorkItemList {
                 }
                 elseif ($idx -eq $SelectedIndex) {
                     Write-Host $padded -ForegroundColor White -BackgroundColor DarkCyan
+                }
+                elseif ($item.IsRelated) {
+                    Write-Host $padded -ForegroundColor Yellow
                 }
                 elseif (-not $item.IsMine) {
                     Write-Host $padded -ForegroundColor DarkGray
@@ -1183,6 +1196,120 @@ function Render-QueryForm {
     }
     else {
         $statusText = " Fill in filters and press Enter on 'Run Search' "
+        $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
+        Write-Host $statusPadded -ForegroundColor Gray -BackgroundColor DarkGray -NoNewline
+    }
+}
+# ── Render parent-item search form (Pri tab) ────────────────────────
+function Render-PriSearchForm {
+    param(
+        [hashtable]$PriData,
+        [array]$TabNames       = @(),
+        [int]$ActiveTabIndex   = -1,
+        [string]$StatusMessage = ""
+    )
+
+    [Console]::CursorVisible = $false
+    [Console]::SetCursorPosition(0, 0)
+
+    $width  = [Console]::WindowWidth
+    $height = [Console]::WindowHeight
+
+    # Header
+    $header = " AZURE DEVOPS TIME TRACKER "
+    $padLen = [Math]::Max(0, $width - $header.Length)
+    Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkBlue
+
+    # Tab bar
+    if ($TabNames.Count -gt 0 -and $ActiveTabIndex -ge 0) {
+        Render-TabBarLine -TabNames $TabNames -ActiveTabIndex $ActiveTabIndex -Width $width
+    }
+
+    # Help line
+    $inResults = $PriData.FormState -eq 'results'
+    $helpLine = if ($inResults) {
+        " [Up/Down] Select parent  [Enter] Confirm  [ESC] Back to search  [Tab] Switch tab "
+    }
+    else {
+        " [Type] Work item ID or title  [Enter] Fetch/Search  [ESC] Cancel  [Tab] Switch tab "
+    }
+    $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
+    Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
+
+    # Section title
+    Write-Host ""
+    Write-Host "  PARENT WORK ITEM" -ForegroundColor Cyan
+    Write-Host ""
+
+    $usedLines = 6  # header(1) + tabbar(1) + helpline(1) + blank(1) + title(1) + blank(1)
+
+    # Current parent info
+    if ($PriData.HasParent) {
+        $parentLine = "  Current: #$($PriData.ParentId) - $($PriData.ParentTitle)"
+        Write-Host (Format-FixedWidth -Text $parentLine -Width $width) -ForegroundColor Green
+        Write-Host ""
+        $usedLines += 2
+    }
+
+    # Search input line
+    $inputLabel = "  Search (ID or title): "
+    $inputVal   = if ($PriData.SearchInput) { $PriData.SearchInput } else { "" }
+    $inputLine  = "$inputLabel[$inputVal]_"
+    $paddedInput = Format-FixedWidth -Text $inputLine -Width $width
+    if (-not $inResults) {
+        Write-Host $paddedInput -ForegroundColor White -BackgroundColor DarkCyan
+    }
+    else {
+        Write-Host $paddedInput -ForegroundColor White
+    }
+    $usedLines++
+
+    # Results list
+    if ($inResults -and $PriData.SearchResults.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Results ($($PriData.SearchResults.Count) found):" -ForegroundColor Gray
+        $usedLines += 2
+
+        $maxResults = $height - $usedLines - 2  # leave 2 lines: blank+status
+        if ($maxResults -lt 1) { $maxResults = 1 }
+
+        for ($i = 0; $i -lt [Math]::Min($PriData.SearchResults.Count, $maxResults); $i++) {
+            $r = $PriData.SearchResults[$i]
+            $icon = Get-TypeIcon -Type $r.Type
+            $prefix = if ($i -eq $PriData.SearchResultIndex) { "  > " } else { "    " }
+            $stateStr = if ($r.State) { "[$($r.State)] " } else { "" }
+            $lineText = "$prefix$icon #$($r.Id) $stateStr$($r.Title)"
+            $padded2 = Format-FixedWidth -Text $lineText -Width $width
+            if ($i -eq $PriData.SearchResultIndex) {
+                Write-Host $padded2 -ForegroundColor White -BackgroundColor DarkCyan
+            }
+            else {
+                $typeColor = Get-TypeColor -Type $r.Type
+                Write-Host $padded2 -ForegroundColor $typeColor
+            }
+            $usedLines++
+        }
+    }
+
+    # Fill remaining lines
+    $remaining = $height - $usedLines - 2
+    for ($l = 0; $l -lt $remaining; $l++) {
+        Write-Host (" " * $width)
+    }
+
+    # Status bar
+    if ($StatusMessage) {
+        $statusText = " $StatusMessage "
+        $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
+        Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkGreen -NoNewline
+    }
+    else {
+        $statusText = if ($PriData.HasParent) {
+            " Parent: #$($PriData.ParentId) $($PriData.ParentTitle) - type to search for a different parent "
+        }
+        else {
+            " Enter a work item ID (e.g. 12345) or part of a title, then press Enter "
+        }
         $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
         Write-Host $statusPadded -ForegroundColor Gray -BackgroundColor DarkGray -NoNewline
     }

@@ -8,8 +8,9 @@ Please note that this whole thing is vibe coded, use at your own peril.
 - Displays all work items (Epics, Features, User Stories, Tasks, Bugs, Incidents) assigned to you
 - Hierarchical view showing parent-child relationships
 - Closed/Done child tasks remain visible in the list as long as their parent is still active
-- **Tabbed views** — switch between Mine, Mentions, Following, Created by me, and Query tabs
+- **Tabbed views** — switch between Mine, Mentions, Following, Created by me, Query, and Pri tabs
 - **Search / Query tab** — filter work items by title, state, type, assigned-to, or ID with live user autocomplete
+- **Pri tab** — track all children and related items for a configurable parent work item; parent persists across sessions
 - Keyboard-driven navigation
 - View work item details and comments inline (includes assignee)
 - Built-in stopwatch for time tracking
@@ -96,9 +97,9 @@ Start-TimeTracker -Reconfigure
 | `t` | Start/stop time tracking on selected item (on User Stories, creates a child Task first) |
 | `r` | Refresh work item list from Azure DevOps (selection is preserved) |
 | `Tab` / `Shift+Tab` | Cycle through tabs |
-| `1`–`5` | Jump directly to a tab by number |
-| `x` | Toggle showing closed/removed items (Mentions, Following, Created by me tabs) |
-| `/` | Open search form (Query tab) |
+| `1`–`6` | Jump directly to a tab by number |
+| `x` | Toggle showing closed/removed items (Mentions, Following, Created by me, Pri tabs) |
+| `/` | Open search form (Query tab); set parent item (Pri tab) |
 | `m` | Open Tools menu |
 | `q` | Quit (saves all active timers) |
 
@@ -198,7 +199,7 @@ User Stories do not carry time tracking fields themselves. When you press `t` on
 
 ## Tabbed Views
 
-The list is split into five tabs, each with its own independently loaded and scrollable list:
+The list is split into six tabs, each with its own independently loaded and scrollable list:
 
 | Tab | Number | Description |
 |-----|--------|-------------|
@@ -207,10 +208,37 @@ The list is split into five tabs, each with its own independently loaded and scr
 | Following | `3` | Work items you are following |
 | Created by me | `4` | Work items you created |
 | Query | `5` | Custom filtered search |
+| Pri | `6` | Children and related items of a chosen parent work item |
 
-Switch tabs with `Tab` / `Shift+Tab` or press `1`–`5` directly. Each tab remembers its scroll position and selected item independently.
+Switch tabs with `Tab` / `Shift+Tab` or press `1`–`6` directly. Each tab remembers its scroll position and selected item independently.
 
-For the **Mentions**, **Following**, and **Created by me** tabs, press `x` to toggle between active-only and all items (including closed/removed).
+For the **Mentions**, **Following**, **Created by me**, and **Pri** tabs, press `x` to toggle between active-only and all items (including closed/removed).
+
+## Pri Tab
+
+The **Pri** tab gives a focused view of all children (recursively) and directly related items for a single parent work item — useful for tracking a feature, epic, or sprint.
+
+### Setting the parent
+
+Press `6` (or `Tab` to the Pri tab) then press `/` to open the parent search form. You can:
+
+- Enter a **work item ID** directly and press `Enter` to fetch it by ID
+- Enter a **title substring** and press `Enter` to search — if multiple results are found, use `↑` / `↓` to select one and press `Enter`
+
+Once a parent is selected, the children and related items load immediately. The parent selection **persists across sessions** — the next time you launch the tracker, the Pri tab will remember your last parent.
+
+### Pri tab controls
+
+| Key | Action |
+|-----|--------|
+| `/` | Change the parent work item |
+| `r` | Refresh the list for the current parent |
+| `x` | Toggle showing closed/done items |
+| `Escape` | Return to the list after searching |
+
+### Display
+
+Descendant items are indented to reflect their depth in the hierarchy. A `--- Related ---` separator divides direct children from related/dependency items. By default, closed and done items are hidden; press `x` to reveal them.
 
 ## Search (Query Tab)
 
