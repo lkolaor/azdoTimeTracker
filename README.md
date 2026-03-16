@@ -99,7 +99,7 @@ Start-TimeTracker -Reconfigure
 | `Page Up` / `Page Down` | Scroll by page |
 | `Home` / `End` | Jump to first/last item |
 | `Enter` | View item details (description + comments) |
-| `t` | Start/stop time tracking on selected item (on User Stories, creates a child Task first) |
+| `t` | Start/stop time tracking on selected item (on User Stories, reuses an existing child Task or creates one) |
 | `r` | Refresh work item list from Azure DevOps (selection is preserved) |
 | `Tab` / `Shift+Tab` | Cycle through tabs |
 | `1`–`6` | Jump directly to a tab by number |
@@ -197,11 +197,10 @@ If the item has no **Original Estimate**, step 3 is skipped and Remaining Work i
 
 User Stories do not carry time tracking fields themselves. When you press `t` on a User Story, the tracker automatically:
 
-1. Creates a new **Task** child item with the title `<ID> <User Story title>` (e.g. `143748 Implement login page`)
-2. Sets **Original Estimate** and **Remaining Work** to **5 hours**
-3. Assigns the task to the same person as the User Story and sets its state to **Active**
-4. Links it as a child of the User Story in Azure DevOps
-5. Selects the new task in the list and starts the timer on it immediately
+1. Checks whether a child item whose title starts with `<ID>` (e.g. `143748 …`) already exists in the list.
+   - **If one is found**, the timer is started on that existing task immediately — no new item is created.
+   - **If none is found**, a new **Task** child item is created with the title `<ID> <User Story title>` (e.g. `143748 Implement login page`), **Original Estimate** and **Remaining Work** set to **5 hours**, assigned to the same person as the User Story, state set to **Active**, and linked as a child in Azure DevOps.
+2. Selects the task in the list and starts the timer on it immediately.
 
 ## Tabbed Views
 

@@ -450,6 +450,20 @@ function Start-TimeTracker {
                                                     ($null -ne $item.RemainingWork)
 
                                     if (-not $supportsTime -and $item.Type -eq 'User Story') {
+                                        # Check if a child item already exists with a title starting with the User Story ID
+                                        $existingChild = $items | Where-Object {
+                                            -not $_.IsSeparator -and
+                                            $_.ParentId -eq $itemId -and
+                                            $_.Title -like "$itemId *"
+                                        } | Select-Object -First 1
+
+                                        if ($existingChild) {
+                                            $activeTimers[$existingChild.Id] = [System.Diagnostics.Stopwatch]::StartNew()
+                                            $existingIdx = $items.IndexOf($existingChild)
+                                            if ($existingIdx -ge 0) { $selectedIndex = $existingIdx }
+                                            $statusMessage = "Started timer on existing task #$($existingChild.Id)"
+                                        }
+                                        else {
                                         # Create a child Task for the User Story
                                         $taskTitle = "$($item.Id) $($item.Title)"
                                         $assignedTo = Get-SafeField -Fields $item.Raw.fields -Name 'System.AssignedTo'
@@ -497,6 +511,7 @@ function Start-TimeTracker {
                                         catch {
                                             $statusMessage = "Error creating task: $($_.Exception.Message)"
                                         }
+                                        } # end else (no existing child)
                                     }
                                     elseif (-not $supportsTime) {
                                         $statusMessage = "Item #$itemId has no time tracking fields"
