@@ -1418,20 +1418,20 @@ function Render-PriSearchForm {
 
 # ── Copy text to system clipboard ──────────────────────────────────
 function Set-TTClipboard {
-    param([string]$Text)
-    try {
-        Set-Clipboard -Value $Text -ErrorAction Stop
-        return $true
-    } catch {}
-    # Fallback for Linux
+    param(
+        [string]$Text,
+        [string]$MimeType = 'text/plain'
+    )
+    # Try native clipboard tools first (more reliable in TUI context)
     if ($IsLinux) {
         foreach ($tool in @('xclip', 'xsel', 'wl-copy')) {
             if (Get-Command $tool -ErrorAction SilentlyContinue) {
                 try {
                     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
                     $psi = [System.Diagnostics.ProcessStartInfo]::new($tool)
-                    if ($tool -eq 'xclip') { $psi.Arguments = '-selection clipboard' }
+                    if ($tool -eq 'xclip') { $psi.Arguments = "-selection clipboard -t $MimeType" }
                     elseif ($tool -eq 'xsel') { $psi.Arguments = '--clipboard --input' }
+                    elseif ($tool -eq 'wl-copy') { $psi.Arguments = "--type $MimeType" }
                     $psi.RedirectStandardInput = $true
                     $psi.UseShellExecute = $false
                     $psi.CreateNoWindow = $true
@@ -1457,20 +1457,163 @@ function Set-TTClipboard {
             return $true
         } catch {}
     }
+    # Fallback to PowerShell Set-Clipboard (plain text only)
+    if ($MimeType -eq 'text/plain') {
+        try {
+            Set-Clipboard -Value $Text -ErrorAction Stop
+            return $true
+        } catch {}
+    }
     return $false
+}
+
+# ── Scrum report language strings ───────────────────────────────
+function Get-ScrumStrings {
+    param([string]$Language = 'en')
+
+    switch ($Language) {
+        'nn' {
+            return @{
+                Yesterday      = 'Kva eg gjorde i går'
+                Today          = 'Kva eg skal gjere i dag'
+                Closed         = 'Lukka/Løyst:'
+                Commented      = 'Kommentert på:'
+                Edited         = 'Redigert/Oppdatert timar:'
+                NoActivity     = '(inga aktivitet funne)'
+                FollowUp       = 'Følgje opp (usvara kommentarar/omtalingar):'
+                Active         = 'Aktiv-kolonne på Teams-tavlene mine:'
+                NoItems        = '(ingen element funne)'
+                LangLabel      = 'Nynorsk'
+            }
+        }
+        'nb' {
+            return @{
+                Yesterday      = 'Hva jeg gjorde i går'
+                Today          = 'Hva jeg skal gjøre i dag'
+                Closed         = 'Lukket/Løst:'
+                Commented      = 'Kommentert på:'
+                Edited         = 'Redigert/Oppdatert timer:'
+                NoActivity     = '(ingen aktivitet funnet)'
+                FollowUp       = 'Følge opp (ubesvarte kommentarer/omtaler):'
+                Active         = 'Aktiv-kolonne på Teams-tavlene mine:'
+                NoItems        = '(ingen elementer funnet)'
+                LangLabel      = 'Bokmål'
+            }
+        }
+        default {
+            return @{
+                Yesterday      = 'What I did yesterday'
+                Today          = 'What I am going to do today'
+                Closed         = 'Closed/Resolved:'
+                Commented      = 'Commented on:'
+                Edited         = 'Edited/Updated hours:'
+                NoActivity     = '(no activity found)'
+                FollowUp       = 'Follow up (unanswered comments/mentions):'
+                Active         = 'Active column on my Teams Boards:'
+                NoItems        = '(no items found)'
+                LangLabel      = 'English'
+            }
+        }
+    }
+}
+
+# ── Build HTML clipboard content for pasting into Teams ───────────
+function Build-ScrumClipboardText {
+    param(
+        [hashtable]$ReportData,
+        [string]$Organization,
+        [string]$Project,
+        [string]$Language = 'en'
+    )
+
+    $str = Get-ScrumStrings -Language $Language
+
+    $encodedProject = [Uri]::EscapeDataString($Project)
+    $sb = [System.Text.StringBuilder]::new()
+
+    # Helper to HTML-encode text
+    function HtmlEncode([string]$s) { [System.Net.WebUtility]::HtmlEncode($s) }
+
+    # Helper to build a linked item line
+    function ItemHtml($item) {
+        $url = "https://dev.azure.com/$Organization/$encodedProject/_workitems/edit/$($item.Id)"
+        $type = HtmlEncode $item.Type
+        $title = HtmlEncode $item.Title
+        return "<li>[$type] <a href=`"$url`">#$($item.Id): $title</a></li>"
+    }
+
+    [void]$sb.AppendLine("<b>$($str.Yesterday)</b><br>")
+
+    if ($ReportData.ClosedItems.Count -gt 0) {
+        [void]$sb.AppendLine("<i>$($str.Closed)</i><ul>")
+        foreach ($item in $ReportData.ClosedItems) {
+            [void]$sb.AppendLine((ItemHtml $item))
+        }
+        [void]$sb.AppendLine("</ul>")
+    }
+
+    if ($ReportData.CommentedItems.Count -gt 0) {
+        [void]$sb.AppendLine("<i>$($str.Commented)</i><ul>")
+        foreach ($item in $ReportData.CommentedItems) {
+            [void]$sb.AppendLine((ItemHtml $item))
+        }
+        [void]$sb.AppendLine("</ul>")
+    }
+
+    if ($ReportData.EditedItems.Count -gt 0) {
+        [void]$sb.AppendLine("<i>$($str.Edited)</i><ul>")
+        foreach ($item in $ReportData.EditedItems) {
+            [void]$sb.AppendLine((ItemHtml $item))
+        }
+        [void]$sb.AppendLine("</ul>")
+    }
+
+    $yesterdayCount = $ReportData.ClosedItems.Count + $ReportData.CommentedItems.Count + $ReportData.EditedItems.Count
+    if ($yesterdayCount -eq 0) {
+        [void]$sb.AppendLine("<i>$($str.NoActivity)</i><br>")
+    }
+
+    [void]$sb.AppendLine("<b>$($str.Today)</b><br>")
+
+    if ($ReportData.FollowUpItems.Count -gt 0) {
+        [void]$sb.AppendLine("<i>$($str.FollowUp)</i><ul>")
+        foreach ($item in $ReportData.FollowUpItems) {
+            [void]$sb.AppendLine((ItemHtml $item))
+        }
+        [void]$sb.AppendLine("</ul>")
+    }
+
+    if ($ReportData.ActiveItems.Count -gt 0) {
+        [void]$sb.AppendLine("<i>$($str.Active)</i><ul>")
+        foreach ($item in $ReportData.ActiveItems) {
+            [void]$sb.AppendLine((ItemHtml $item))
+        }
+        [void]$sb.AppendLine("</ul>")
+    }
+
+    $todayCount = $ReportData.FollowUpItems.Count + $ReportData.ActiveItems.Count
+    if ($todayCount -eq 0) {
+        [void]$sb.AppendLine("<i>$($str.NoItems)</i><br>")
+    }
+
+    return $sb.ToString()
 }
 
 # ── Build plain text scrum report ──────────────────────────────────
 function Build-ScrumReportText {
-    param([hashtable]$ReportData)
+    param(
+        [hashtable]$ReportData,
+        [string]$Language = 'en'
+    )
 
+    $str = Get-ScrumStrings -Language $Language
     $sb = [System.Text.StringBuilder]::new()
 
-    [void]$sb.AppendLine("** What I did yesterday")
+    [void]$sb.AppendLine("** $($str.Yesterday)")
     [void]$sb.AppendLine()
 
     if ($ReportData.ClosedItems.Count -gt 0) {
-        [void]$sb.AppendLine("* Closed/Resolved:")
+        [void]$sb.AppendLine("* $($str.Closed)")
         foreach ($item in $ReportData.ClosedItems) {
             [void]$sb.AppendLine("  - [$($item.Type)] #$($item.Id): $($item.Title)")
         }
@@ -1478,7 +1621,7 @@ function Build-ScrumReportText {
     }
 
     if ($ReportData.CommentedItems.Count -gt 0) {
-        [void]$sb.AppendLine("* Commented on:")
+        [void]$sb.AppendLine("* $($str.Commented)")
         foreach ($item in $ReportData.CommentedItems) {
             [void]$sb.AppendLine("  - [$($item.Type)] #$($item.Id): $($item.Title)")
         }
@@ -1486,7 +1629,7 @@ function Build-ScrumReportText {
     }
 
     if ($ReportData.EditedItems.Count -gt 0) {
-        [void]$sb.AppendLine("* Edited/Updated hours:")
+        [void]$sb.AppendLine("* $($str.Edited)")
         foreach ($item in $ReportData.EditedItems) {
             [void]$sb.AppendLine("  - [$($item.Type)] #$($item.Id): $($item.Title)")
         }
@@ -1495,15 +1638,15 @@ function Build-ScrumReportText {
 
     $yesterdayCount = $ReportData.ClosedItems.Count + $ReportData.CommentedItems.Count + $ReportData.EditedItems.Count
     if ($yesterdayCount -eq 0) {
-        [void]$sb.AppendLine("  (no activity found)")
+        [void]$sb.AppendLine("  $($str.NoActivity)")
         [void]$sb.AppendLine()
     }
 
-    [void]$sb.AppendLine("** What I am going to do today")
+    [void]$sb.AppendLine("** $($str.Today)")
     [void]$sb.AppendLine()
 
     if ($ReportData.FollowUpItems.Count -gt 0) {
-        [void]$sb.AppendLine("* Follow up (unanswered comments/mentions):")
+        [void]$sb.AppendLine("* $($str.FollowUp)")
         foreach ($item in $ReportData.FollowUpItems) {
             [void]$sb.AppendLine("  - [$($item.Type)] #$($item.Id): $($item.Title)")
         }
@@ -1511,7 +1654,7 @@ function Build-ScrumReportText {
     }
 
     if ($ReportData.ActiveItems.Count -gt 0) {
-        [void]$sb.AppendLine("* Active column on my Teams Boards:")
+        [void]$sb.AppendLine("* $($str.Active)")
         foreach ($item in $ReportData.ActiveItems) {
             [void]$sb.AppendLine("  - [$($item.Type)] #$($item.Id): $($item.Title)")
         }
@@ -1520,11 +1663,41 @@ function Build-ScrumReportText {
 
     $todayCount = $ReportData.FollowUpItems.Count + $ReportData.ActiveItems.Count
     if ($todayCount -eq 0) {
-        [void]$sb.AppendLine("  (no items found)")
+        [void]$sb.AppendLine("  $($str.NoItems)")
         [void]$sb.AppendLine()
     }
 
     return $sb.ToString().TrimEnd()
+}
+
+# ── Build line-to-item map for scrum report ──────────────────────
+function Build-ScrumLineItemMap {
+    param(
+        [array]$Lines,
+        [hashtable]$ReportData
+    )
+
+    # Build a lookup from work item Id to item object
+    $itemLookup = @{}
+    foreach ($category in @('ClosedItems','CommentedItems','EditedItems','FollowUpItems','ActiveItems')) {
+        foreach ($item in $ReportData[$category]) {
+            if ($item.Id -and -not $itemLookup.ContainsKey([int]$item.Id)) {
+                $itemLookup[[int]$item.Id] = $item
+            }
+        }
+    }
+
+    # Map each line to an item (or $null)
+    $map = [object[]]::new($Lines.Count)
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i] -match '^\s+-\s\[.+?\]\s#(\d+):') {
+            $id = [int]$Matches[1]
+            if ($itemLookup.ContainsKey($id)) {
+                $map[$i] = $itemLookup[$id]
+            }
+        }
+    }
+    return ,$map
 }
 
 # ── Render SCRUM report view ──────────────────────────────────────
@@ -1534,7 +1707,10 @@ function Render-ScrumReport {
         [int]$ScrollOffset,
         [array]$TabNames = @(),
         [int]$ActiveTabIndex = -1,
-        [string]$StatusMessage = ""
+        [string]$StatusMessage = "",
+        [int]$SelectedLine = -1,
+        [array]$LineItemMap = @(),
+        [string]$Language = 'en'
     )
 
     [Console]::CursorVisible = $false
@@ -1556,33 +1732,53 @@ function Render-ScrumReport {
     }
 
     # Help bar
-    $helpLine = " [Arrows/PgUp/PgDn] Scroll  [c] Copy to clipboard  [r] Refresh  [Tab] Switch tab  [q] Quit "
+    $langLabel = (Get-ScrumStrings -Language $Language).LangLabel
+    $helpLine = " [Arrows] Navigate  [Enter] Info  [c] Copy  [l] Lang: $langLabel  [r] Refresh  [Tab] Switch tab  [q] Quit "
     $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
     Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
 
     # Available lines for content
     $availableLines = $height - 3 - $tabBarLines
 
+    # Auto-scroll to keep selected line visible
+    if ($SelectedLine -ge 0) {
+        if ($SelectedLine -lt $ScrollOffset) {
+            $ScrollOffset = $SelectedLine
+        }
+        if ($SelectedLine -ge ($ScrollOffset + $availableLines)) {
+            $ScrollOffset = $SelectedLine - $availableLines + 1
+        }
+    }
+
     for ($l = 0; $l -lt $availableLines; $l++) {
         $lineIdx = $ScrollOffset + $l
         if ($lineIdx -lt $Lines.Count) {
             $lineText = $Lines[$lineIdx]
-            $padded = Format-FixedWidth -Text "  $lineText" -Width $width
-            # Color coding based on content
-            if ($lineText -match '^\*\*\s') {
-                Write-Host $padded -ForegroundColor Cyan
-            }
-            elseif ($lineText -match '^\*\s') {
-                Write-Host $padded -ForegroundColor Yellow
-            }
-            elseif ($lineText -match '^\s+-\s\[') {
-                Write-Host $padded -ForegroundColor White
-            }
-            elseif ($lineText -match '^\s+\(no ') {
-                Write-Host $padded -ForegroundColor DarkGray
+            $isItemLine = $LineItemMap.Count -gt $lineIdx -and $null -ne $LineItemMap[$lineIdx]
+            $isSelected = $lineIdx -eq $SelectedLine -and $isItemLine
+
+            if ($isSelected) {
+                $padded = Format-FixedWidth -Text "> $lineText" -Width $width
+                Write-Host $padded -ForegroundColor White -BackgroundColor DarkCyan
             }
             else {
-                Write-Host $padded -ForegroundColor Gray
+                $padded = Format-FixedWidth -Text "  $lineText" -Width $width
+                # Color coding based on content
+                if ($lineText -match '^\*\*\s') {
+                    Write-Host $padded -ForegroundColor Cyan
+                }
+                elseif ($lineText -match '^\*\s') {
+                    Write-Host $padded -ForegroundColor Yellow
+                }
+                elseif ($lineText -match '^\s+-\s\[') {
+                    Write-Host $padded -ForegroundColor White
+                }
+                elseif ($lineText -match '^\s+\(no ') {
+                    Write-Host $padded -ForegroundColor DarkGray
+                }
+                else {
+                    Write-Host $padded -ForegroundColor Gray
+                }
             }
         }
         else {

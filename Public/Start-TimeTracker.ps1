@@ -179,13 +179,22 @@ function Start-TimeTracker {
     }
 
     # ── Scrum report state ────────────────────────────────────────────
+    $savedScrumLang = 'en'
+    $scrumLangProp = $config.PSObject.Properties['ScrumLanguage']
+    if ($null -ne $scrumLangProp -and $scrumLangProp.Value -in @('en','nn','nb')) {
+        $savedScrumLang = [string]$scrumLangProp.Value
+    }
     $scrumData = @{
         ReportData   = $null
         ReportText   = ""
         ReportLines  = @()
+        LineItemMap  = @()
+        SelectedLine = -1
         ScrollOffset = 0
         Loaded       = $false
+        Language     = $savedScrumLang
     }
+    $detailReturnMode = "list"
 
     # ── Save a single timer ──────────────────────────────────────────
     function Save-Timer {
@@ -499,6 +508,7 @@ function Start-TimeTracker {
                                     Comments    = $comments
                                 }
                                 $detailScrollOffset = 0
+                                $detailReturnMode = "list"
                                 $mode = "detail"
                                 [Console]::Clear()
                             }
@@ -832,7 +842,8 @@ function Start-TimeTracker {
 
                     switch ($key.Key) {
                         'Escape' {
-                            $mode = "list"
+                            $mode = $detailReturnMode
+                            $detailReturnMode = "list"
                             $detailData = $null
                             [Console]::Clear()
                         }
@@ -2045,8 +2056,17 @@ function Start-TimeTracker {
                         $scrumData.ReportData = Get-ScrumReportData `
                             -Organization $config.Organization `
                             -Project $config.Project -PAT $config.PAT
-                        $scrumData.ReportText = Build-ScrumReportText -ReportData $scrumData.ReportData
+                        $scrumData.ReportText = Build-ScrumReportText -ReportData $scrumData.ReportData -Language $scrumData.Language
                         $scrumData.ReportLines = @($scrumData.ReportText -split "`n")
+                        $scrumData.LineItemMap = Build-ScrumLineItemMap -Lines $scrumData.ReportLines -ReportData $scrumData.ReportData
+                        # Set initial selection to first item line
+                        $scrumData.SelectedLine = -1
+                        for ($si = 0; $si -lt $scrumData.LineItemMap.Count; $si++) {
+                            if ($null -ne $scrumData.LineItemMap[$si]) {
+                                $scrumData.SelectedLine = $si
+                                break
+                            }
+                        }
                         $scrumData.Loaded = $true
                         $scrumData.ScrollOffset = 0
                         [Console]::Clear()
@@ -2056,7 +2076,10 @@ function Start-TimeTracker {
                         -Lines $scrumData.ReportLines `
                         -ScrollOffset $scrumData.ScrollOffset `
                         -TabNames $tabNames -ActiveTabIndex $activeTab `
-                        -StatusMessage $statusMessage
+                        -StatusMessage $statusMessage `
+                        -SelectedLine $scrumData.SelectedLine `
+                        -LineItemMap $scrumData.LineItemMap `
+                        -Language $scrumData.Language
                     $statusMessage = ""
 
                     $key = [Console]::ReadKey($true)
@@ -2072,27 +2095,143 @@ function Start-TimeTracker {
                             [Console]::Clear()
                         }
                         'UpArrow' {
-                            if ($scrumData.ScrollOffset -gt 0) { $scrumData.ScrollOffset-- }
+                            # Move selection to previous item line
+                            if ($scrumData.SelectedLine -gt 0) {
+                                for ($si = $scrumData.SelectedLine - 1; $si -ge 0; $si--) {
+                                    if ($null -ne $scrumData.LineItemMap[$si]) {
+                                        $scrumData.SelectedLine = $si
+                                        break
+                                    }
+                                }
+                            }
                         }
                         'DownArrow' {
-                            $maxScroll = [Math]::Max(0, $scrumData.ReportLines.Count - ([Console]::WindowHeight - 4))
-                            if ($scrumData.ScrollOffset -lt $maxScroll) { $scrumData.ScrollOffset++ }
+                            # Move selection to next item line
+                            if ($scrumData.SelectedLine -lt ($scrumData.ReportLines.Count - 1)) {
+                                for ($si = $scrumData.SelectedLine + 1; $si -lt $scrumData.LineItemMap.Count; $si++) {
+                                    if ($null -ne $scrumData.LineItemMap[$si]) {
+                                        $scrumData.SelectedLine = $si
+                                        break
+                                    }
+                                }
+                            }
                         }
                         'PageUp' {
-                            $scrumData.ScrollOffset = [Math]::Max(0, $scrumData.ScrollOffset - ([Console]::WindowHeight - 4))
+                            # Jump up ~page worth of item lines
+                            $jumps = [Console]::WindowHeight - 4
+                            $newLine = $scrumData.SelectedLine
+                            for ($si = $scrumData.SelectedLine - 1; $si -ge 0 -and $jumps -gt 0; $si--) {
+                                if ($null -ne $scrumData.LineItemMap[$si]) {
+                                    $newLine = $si
+                                    $jumps--
+                                }
+                            }
+                            $scrumData.SelectedLine = $newLine
                         }
                         'PageDown' {
-                            $maxScroll = [Math]::Max(0, $scrumData.ReportLines.Count - ([Console]::WindowHeight - 4))
-                            $scrumData.ScrollOffset = [Math]::Min($maxScroll, $scrumData.ScrollOffset + ([Console]::WindowHeight - 4))
+                            # Jump down ~page worth of item lines
+                            $jumps = [Console]::WindowHeight - 4
+                            $newLine = $scrumData.SelectedLine
+                            for ($si = $scrumData.SelectedLine + 1; $si -lt $scrumData.LineItemMap.Count -and $jumps -gt 0; $si++) {
+                                if ($null -ne $scrumData.LineItemMap[$si]) {
+                                    $newLine = $si
+                                    $jumps--
+                                }
+                            }
+                            $scrumData.SelectedLine = $newLine
+                        }
+                        'Enter' {
+                            # Open detail for the selected item
+                            if ($scrumData.SelectedLine -ge 0 -and
+                                $scrumData.LineItemMap.Count -gt $scrumData.SelectedLine -and
+                                $null -ne $scrumData.LineItemMap[$scrumData.SelectedLine]) {
+
+                                $item = $scrumData.LineItemMap[$scrumData.SelectedLine]
+                                [Console]::Clear()
+                                Write-Host "`n  Loading work item #$($item.Id)..." -ForegroundColor Cyan
+
+                                $detail = Get-WorkItemDetail -Organization $config.Organization `
+                                    -Project $config.Project -PAT $config.PAT `
+                                    -WorkItemId $item.Id
+
+                                $comments = @(Get-WorkItemComments -Organization $config.Organization `
+                                    -Project $config.Project -PAT $config.PAT `
+                                    -WorkItemId $item.Id)
+
+                                $description = ""
+                                $reproSteps = ""
+                                $systemInfo = ""
+                                if ($detail -and $detail.fields) {
+                                    $descProp = $detail.fields.PSObject.Properties['System.Description']
+                                    if ($descProp -and $descProp.Value) {
+                                        $description = $descProp.Value
+                                    }
+                                    $reproProp = $detail.fields.PSObject.Properties['Microsoft.VSTS.TCM.ReproSteps']
+                                    if ($reproProp -and $reproProp.Value) {
+                                        $reproSteps = $reproProp.Value
+                                    }
+                                    $sysInfoProp = $detail.fields.PSObject.Properties['Microsoft.VSTS.TCM.SystemInfo']
+                                    if ($sysInfoProp -and $sysInfoProp.Value) {
+                                        $systemInfo = $sysInfoProp.Value
+                                    }
+                                }
+
+                                $detailData = @{
+                                    Item        = $item
+                                    Description = $description
+                                    ReproSteps  = $reproSteps
+                                    SystemInfo  = $systemInfo
+                                    Comments    = $comments
+                                }
+                                $detailScrollOffset = 0
+                                $detailReturnMode = "scrumreport"
+                                $mode = "detail"
+                                [Console]::Clear()
+                            }
                         }
                         'R' {
                             $scrumData.Loaded = $false
                             $statusMessage = "Refreshing scrum report..."
                             [Console]::Clear()
                         }
+                        'L' {
+                            # Cycle language: en -> nn -> nb -> en
+                            $scrumData.Language = switch ($scrumData.Language) {
+                                'en' { 'nn' }
+                                'nn' { 'nb' }
+                                'nb' { 'en' }
+                            }
+                            # Rebuild report text with new language
+                            if ($scrumData.ReportData) {
+                                $scrumData.ReportText = Build-ScrumReportText -ReportData $scrumData.ReportData -Language $scrumData.Language
+                                $scrumData.ReportLines = @($scrumData.ReportText -split "`n")
+                                $scrumData.LineItemMap = Build-ScrumLineItemMap -Lines $scrumData.ReportLines -ReportData $scrumData.ReportData
+                                # Keep selection on an item line
+                                if ($scrumData.SelectedLine -ge $scrumData.ReportLines.Count -or
+                                    $scrumData.SelectedLine -lt 0 -or
+                                    $null -eq $scrumData.LineItemMap[$scrumData.SelectedLine]) {
+                                    $scrumData.SelectedLine = -1
+                                    for ($si = 0; $si -lt $scrumData.LineItemMap.Count; $si++) {
+                                        if ($null -ne $scrumData.LineItemMap[$si]) {
+                                            $scrumData.SelectedLine = $si
+                                            break
+                                        }
+                                    }
+                                }
+                            }
+                            $langName = (Get-ScrumStrings -Language $scrumData.Language).LangLabel
+                            $statusMessage = "Language: $langName"
+                            # Persist language choice
+                            Save-ScrumLanguageConfig -Language $scrumData.Language
+                        }
                         'C' {
-                            if ($scrumData.ReportText) {
-                                $copied = Set-TTClipboard -Text $scrumData.ReportText
+                            if ($scrumData.ReportData) {
+                                $clipText = Build-ScrumClipboardText `
+                                    -ReportData $scrumData.ReportData `
+                                    -Organization $config.Organization `
+                                    -Project $config.Project `
+                                    -Language $scrumData.Language
+                                $copied = Set-TTClipboard -Text $clipText -MimeType 'text/html'
                                 if ($copied) {
                                     $statusMessage = "Report copied to clipboard!"
                                 }

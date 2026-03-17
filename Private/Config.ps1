@@ -38,7 +38,8 @@ function Save-TTConfig {
         [string]$Project,
         [string]$PAT,
         [int]$PriParentId = 0,
-        [string]$PriParentTitle = ""
+        [string]$PriParentTitle = "",
+        [string]$ScrumLanguage = 'en'
     )
 
     $configDir = Get-TTConfigDir
@@ -52,6 +53,7 @@ function Save-TTConfig {
         PAT            = $PAT
         PriParentId    = $PriParentId
         PriParentTitle = $PriParentTitle
+        ScrumLanguage  = $ScrumLanguage
     }
     $configPath = Get-TTConfigPath
     $config | ConvertTo-Json | Set-Content $configPath
@@ -67,8 +69,21 @@ function Save-PriParentConfig {
     $org   = if ($existing -and $existing.Organization) { $existing.Organization } else { "" }
     $proj  = if ($existing -and $existing.Project)      { $existing.Project      } else { "" }
     $pat   = if ($existing -and $existing.PAT)          { $existing.PAT          } else { "" }
+    $lang  = if ($existing -and $existing.ScrumLanguage) { $existing.ScrumLanguage } else { 'en' }
     Save-TTConfig -Organization $org -Project $proj -PAT $pat `
-        -PriParentId $ParentId -PriParentTitle $ParentTitle | Out-Null
+        -PriParentId $ParentId -PriParentTitle $ParentTitle -ScrumLanguage $lang | Out-Null
+}
+
+function Save-ScrumLanguageConfig {
+    param([string]$Language = 'en')
+    $existing = Get-TTConfig
+    $org   = if ($existing -and $existing.Organization)  { $existing.Organization  } else { "" }
+    $proj  = if ($existing -and $existing.Project)       { $existing.Project       } else { "" }
+    $pat   = if ($existing -and $existing.PAT)           { $existing.PAT           } else { "" }
+    $pid2  = if ($existing -and $existing.PriParentId)   { [int]$existing.PriParentId } else { 0 }
+    $ptit  = if ($existing -and $existing.PriParentTitle){ [string]$existing.PriParentTitle } else { "" }
+    Save-TTConfig -Organization $org -Project $proj -PAT $pat `
+        -PriParentId $pid2 -PriParentTitle $ptit -ScrumLanguage $Language | Out-Null
 }
 
 function Initialize-TTConfig {
@@ -120,9 +135,11 @@ function Request-TTConfig {
 
     $existingParentId    = if ($existing -and $existing.PriParentId)    { [int]$existing.PriParentId    } else { 0  }
     $existingParentTitle = if ($existing -and $existing.PriParentTitle) { [string]$existing.PriParentTitle } else { "" }
+    $existingScrumLang   = if ($existing -and $existing.ScrumLanguage)  { [string]$existing.ScrumLanguage } else { 'en' }
 
     $config = Save-TTConfig -Organization $org -Project $proj -PAT $pat `
-        -PriParentId $existingParentId -PriParentTitle $existingParentTitle
+        -PriParentId $existingParentId -PriParentTitle $existingParentTitle `
+        -ScrumLanguage $existingScrumLang
     Write-Host "Configuration saved to: $(Get-TTConfigPath)" -ForegroundColor Green
     Write-Host ""
     return $config

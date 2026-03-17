@@ -8,7 +8,7 @@ Please note that this whole thing is vibe coded, use at your own peril.
 - Displays all work items (Epics, Features, User Stories, Tasks, Bugs, Incidents) assigned to you
 - Hierarchical view showing parent-child relationships
 - Closed/Done child tasks remain visible in the list as long as their parent is still active
-- **Tabbed views** — switch between Mine, Mentions, Following, Created by me, Query, and Pri tabs
+- **Tabbed views** — switch between Mine, Mentions, Following, Created by me, Query, Pri, and Scrum tabs
 - **Search / Query tab** — filter work items by title, state, type, assigned-to, or ID with live user autocomplete
 - **Pri tab** — track all children and related items for a configurable parent work item; parent persists across sessions
 - Keyboard-driven navigation
@@ -102,7 +102,7 @@ Start-TimeTracker -Reconfigure
 | `t` | Start/stop time tracking on selected item (on User Stories, reuses an existing child Task or creates one) |
 | `r` | Refresh work item list from Azure DevOps (selection is preserved) |
 | `Tab` / `Shift+Tab` | Cycle through tabs |
-| `1`–`6` | Jump directly to a tab by number |
+| `1`–`7` | Jump directly to a tab by number |
 | `x` | Toggle showing closed/removed items (Mentions, Following, Created by me, Pri tabs) |
 | `/` | Open search form (Query tab); set parent item (Pri tab) |
 | `m` | Open Tools menu |
@@ -204,7 +204,7 @@ User Stories do not carry time tracking fields themselves. When you press `t` on
 
 ## Tabbed Views
 
-The list is split into six tabs, each with its own independently loaded and scrollable list:
+The list is split into seven tabs, each with its own independently loaded and scrollable list:
 
 | Tab | Number | Description |
 |-----|--------|-------------|
@@ -214,8 +214,9 @@ The list is split into six tabs, each with its own independently loaded and scro
 | Created by me | `4` | Work items you created |
 | Query | `5` | Custom filtered search |
 | Pri | `6` | Children and related items of a chosen parent work item |
+| Scrum | `7` | Daily scrum report with selectable items |
 
-Switch tabs with `Tab` / `Shift+Tab` or press `1`–`6` directly. Each tab remembers its scroll position and selected item independently.
+Switch tabs with `Tab` / `Shift+Tab` or press `1`–`7` directly. Each tab remembers its scroll position and selected item independently.
 
 For the **Mentions**, **Following**, **Created by me**, and **Pri** tabs, press `x` to toggle between active-only and all items (including closed/removed).
 
@@ -244,6 +245,28 @@ Once a parent is selected, the children and related items load immediately. The 
 ### Display
 
 Descendant items are indented to reflect their depth in the hierarchy. A `--- Related ---` separator divides direct children from related/dependency items. By default, closed and done items are hidden; press `x` to reveal them.
+
+## Scrum Tab
+
+The **Scrum** tab (`7`) generates a daily stand-up report showing:
+
+- **What I did yesterday** — items closed/resolved, commented on, or edited yesterday
+- **What I am going to do today** — unanswered comments/mentions to follow up on, and items in the Active column on your Teams boards
+
+All items in the report are selectable — use `↑`/`↓` to navigate and `Enter` to open the detail view, just like any other tab.
+
+### Scrum tab controls
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Navigate between items |
+| `Enter` | View item details |
+| `c` | Copy report to clipboard as rich HTML (with clickable links, suitable for pasting into Microsoft Teams) |
+| `l` | Cycle report language (English → Nynorsk → Bokmål) |
+| `r` | Refresh report data |
+| `Page Up` / `Page Down` | Jump selection by page |
+
+The selected language is saved in the config and remembered across sessions.
 
 ## Search (Query Tab)
 
