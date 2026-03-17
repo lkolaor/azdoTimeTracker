@@ -42,7 +42,7 @@ function Get-CurrentUserDisplayName {
     if ($script:CachedDisplayName) { return $script:CachedDisplayName }
 
     $headers = Get-AzDoAuthHeader -PAT $PAT
-    $url = "https://dev.azure.com/$Organization/_apis/connectiondata?api-version=7.1"
+    $url = "https://dev.azure.com/$Organization/_apis/connectiondata?api-version=7.1-preview"
 
     try {
         $result = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop
@@ -1455,4 +1455,343 @@ MODE (Recursive)
     }
 
     return $resultList
+}
+
+# ── Get SCRUM report data (yesterday's activity & today's plan) ────
+function Get-ScrumReportData {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT
+    )
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $baseUrl = "https://dev.azure.com/$Organization/$Project/_apis"
+    $wiqlUrl = "$baseUrl/wit/wiql?api-version=7.1"
+    $myDisplayName = Get-CurrentUserDisplayName -Organization $Organization -PAT $PAT
+    $yesterday = (Get-Date).AddDays(-1).Date
+
+    Write-TTDebugLog "Get-ScrumReportData: myDisplayName=$myDisplayName yesterday=$($yesterday.ToString('yyyy-MM-dd'))"
+
+    # ── 1. Items I closed/resolved yesterday ─────────────────────────
+    $closedQuery = @{
+        query = @"
+SELECT [System.Id]
+FROM WorkItems
+WHERE [System.ChangedBy] = @me
+  AND [System.ChangedDate] >= @Today - 1
+  AND [System.ChangedDate] < @Today
+  AND ([System.State] = 'Closed'
+    OR [System.State] = 'Done'
+    OR [System.State] = 'Resolved'
+    OR [System.State] = 'Released')
+ORDER BY [System.ChangedDate] DESC
+"@
+    } | ConvertTo-Json
+
+    $closedItems = @()
+    try {
+        $result = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers `
+            -ContentType "application/json" -Body $closedQuery -ErrorAction Stop
+        if ($result.workItems -and $result.workItems.Count -gt 0) {
+            $ids = @($result.workItems | ForEach-Object { $_.id } | Select-Object -First 100)
+            $closedItems = @(Get-WorkItemDetailsFromIds -Organization $Organization `
+                -Project $Project -PAT $PAT -Ids $ids)
+        }
+        Write-TTDebugLog "Get-ScrumReportData: closedItems=$($closedItems.Count)"
+    }
+    catch {
+        Write-TTDebugLog "Get-ScrumReportData closed error: $($_.Exception.Message)"
+    }
+
+    $closedIds = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($ci in $closedItems) { [void]$closedIds.Add([int]$ci.Id) }
+
+    # ── 2. Items I edited yesterday (still open) ─────────────────────
+    $changedQuery = @{
+        query = @"
+SELECT [System.Id]
+FROM WorkItems
+WHERE [System.ChangedBy] = @me
+  AND [System.ChangedDate] >= @Today - 1
+  AND [System.ChangedDate] < @Today
+  AND [System.State] <> 'Closed'
+  AND [System.State] <> 'Done'
+  AND [System.State] <> 'Resolved'
+  AND [System.State] <> 'Released'
+  AND [System.State] <> 'Removed'
+ORDER BY [System.ChangedDate] DESC
+"@
+    } | ConvertTo-Json
+
+    $changedItems = @()
+    try {
+        $result = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers `
+            -ContentType "application/json" -Body $changedQuery -ErrorAction Stop
+        if ($result.workItems -and $result.workItems.Count -gt 0) {
+            $ids = @($result.workItems | ForEach-Object { $_.id } | Select-Object -First 100)
+            $ids = @($ids | Where-Object { -not $closedIds.Contains([int]$_) })
+            if ($ids.Count -gt 0) {
+                $changedItems = @(Get-WorkItemDetailsFromIds -Organization $Organization `
+                    -Project $Project -PAT $PAT -Ids $ids)
+            }
+        }
+        Write-TTDebugLog "Get-ScrumReportData: changedItems=$($changedItems.Count)"
+    }
+    catch {
+        Write-TTDebugLog "Get-ScrumReportData changed error: $($_.Exception.Message)"
+    }
+
+    # ── 3. Check comments to split commented vs edited ───────────────
+    $commentedItems = [System.Collections.ArrayList]::new()
+    $editedItems = [System.Collections.ArrayList]::new()
+    $allYesterdayIds = [System.Collections.Generic.HashSet[int]]::new($closedIds)
+
+    foreach ($item in $changedItems) {
+        [void]$allYesterdayIds.Add([int]$item.Id)
+        $hasMyComment = $false
+        try {
+            $comments = @(Get-WorkItemComments -Organization $Organization `
+                -Project $Project -PAT $PAT -WorkItemId $item.Id)
+            foreach ($comment in $comments) {
+                if ($comment.createdBy -and $comment.createdBy.displayName -eq $myDisplayName) {
+                    $commentDate = ([datetime]$comment.createdDate).Date
+                    if ($commentDate -eq $yesterday) {
+                        $hasMyComment = $true
+                        break
+                    }
+                }
+            }
+        }
+        catch {
+            Write-TTDebugLog "Get-ScrumReportData comment check error #$($item.Id): $($_.Exception.Message)"
+        }
+
+        if ($hasMyComment) {
+            [void]$commentedItems.Add($item)
+        }
+        else {
+            [void]$editedItems.Add($item)
+        }
+    }
+
+    Write-TTDebugLog "Get-ScrumReportData: commentedItems=$($commentedItems.Count) editedItems=$($editedItems.Count)"
+
+    # ── Helper: check if a work item has unanswered comments from others ─
+    # Returns $true ONLY when there is at least one real comment from
+    # someone other than $MyName AND we have NOT commented after it.
+    function Test-HasUnansweredComment {
+        param($Organization, $Project, $PAT, [int]$WorkItemId, [string]$MyName)
+
+        $rawComments = $null
+        try {
+            $rawComments = Get-WorkItemComments -Organization $Organization `
+                -Project $Project -PAT $PAT -WorkItemId $WorkItemId
+        }
+        catch {
+            Write-TTDebugLog "Test-HasUnansweredComment #$WorkItemId error: $($_.Exception.Message)"
+            return $false
+        }
+
+        if ($null -eq $rawComments) { return $false }
+
+        # Build a clean array of only real comments
+        $comments = [System.Collections.ArrayList]::new()
+        foreach ($c in $rawComments) {
+            if ($null -eq $c) { continue }
+            if (-not $c.createdBy) { continue }
+            if (-not $c.createdBy.displayName) { continue }
+            [void]$comments.Add($c)
+        }
+        Write-TTDebugLog "Test-HasUnansweredComment #$WorkItemId : $($comments.Count) real comments"
+
+        if ($comments.Count -eq 0) { return $false }
+
+        # Find the last comment by someone other than me
+        $lastOtherComment = $null
+        for ($i = $comments.Count - 1; $i -ge 0; $i--) {
+            if ($comments[$i].createdBy.displayName -ne $MyName) {
+                $lastOtherComment = $comments[$i]
+                break
+            }
+        }
+        if ($null -eq $lastOtherComment) { return $false }
+
+        # Check if I commented after that
+        $otherDate = [datetime]$lastOtherComment.createdDate
+        for ($i = $comments.Count - 1; $i -ge 0; $i--) {
+            $c = $comments[$i]
+            if ($c.createdBy.displayName -eq $MyName -and [datetime]$c.createdDate -gt $otherDate) {
+                return $false
+            }
+        }
+
+        return $true
+    }
+
+    # ── 4. Mentioned yesterday but not responded ─────────────────────
+    $mentionQuery = @{
+        query = @"
+SELECT [System.Id]
+FROM WorkItems
+WHERE [System.Id] IN (@RecentMentions)
+  AND [System.ChangedDate] >= @Today - 1
+  AND [System.ChangedDate] < @Today
+ORDER BY [System.ChangedDate] DESC
+"@
+    } | ConvertTo-Json
+
+    $followUpItems = [System.Collections.ArrayList]::new()
+    $followUpIds = [System.Collections.Generic.HashSet[int]]::new()
+
+    try {
+        $result = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers `
+            -ContentType "application/json" -Body $mentionQuery -ErrorAction Stop
+        if ($result.workItems -and $result.workItems.Count -gt 0) {
+            $ids = @($result.workItems | ForEach-Object { $_.id } | Select-Object -First 100)
+            $ids = @($ids | Where-Object { -not $allYesterdayIds.Contains([int]$_) })
+            if ($ids.Count -gt 0) {
+                $mentionedItems = @(Get-WorkItemDetailsFromIds -Organization $Organization `
+                    -Project $Project -PAT $PAT -Ids $ids)
+                foreach ($item in $mentionedItems) {
+                    if (Test-HasUnansweredComment -Organization $Organization `
+                            -Project $Project -PAT $PAT `
+                            -WorkItemId $item.Id -MyName $myDisplayName) {
+                        [void]$followUpItems.Add($item)
+                        [void]$followUpIds.Add([int]$item.Id)
+                    }
+                }
+            }
+        }
+        Write-TTDebugLog "Get-ScrumReportData: followUpItems (mentions)=$($followUpItems.Count)"
+    }
+    catch {
+        Write-TTDebugLog "Get-ScrumReportData mentions error: $($_.Exception.Message)"
+    }
+
+    # ── 4b. Items assigned to me with unanswered comments from others ─
+    $assignedOpenQuery = @{
+        query = @"
+SELECT [System.Id]
+FROM WorkItems
+WHERE [System.AssignedTo] = @me
+  AND [System.State] <> 'Closed'
+  AND [System.State] <> 'Done'
+  AND [System.State] <> 'Released'
+  AND [System.State] <> 'Removed'
+ORDER BY [System.ChangedDate] DESC
+"@
+    } | ConvertTo-Json
+
+    try {
+        $result = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers `
+            -ContentType "application/json" -Body $assignedOpenQuery -ErrorAction Stop
+        if ($result.workItems -and $result.workItems.Count -gt 0) {
+            $ids = @($result.workItems | ForEach-Object { $_.id } | Select-Object -First 200)
+            $ids = @($ids | Where-Object {
+                -not $allYesterdayIds.Contains([int]$_) -and
+                -not $followUpIds.Contains([int]$_)
+            })
+            if ($ids.Count -gt 0) {
+                $assignedItems = @(Get-WorkItemDetailsFromIds -Organization $Organization `
+                    -Project $Project -PAT $PAT -Ids $ids)
+                foreach ($item in $assignedItems) {
+                    if (Test-HasUnansweredComment -Organization $Organization `
+                            -Project $Project -PAT $PAT `
+                            -WorkItemId $item.Id -MyName $myDisplayName) {
+                        [void]$followUpItems.Add($item)
+                        [void]$followUpIds.Add([int]$item.Id)
+                    }
+                }
+            }
+        }
+        Write-TTDebugLog "Get-ScrumReportData: followUpItems (total)=$($followUpItems.Count)"
+    }
+    catch {
+        Write-TTDebugLog "Get-ScrumReportData assigned-followup error: $($_.Exception.Message)"
+    }
+
+    # ── 5. Items in the "Active" board column on my Teams' boards ────
+    $activeItems = @()
+    try {
+        $activeItems = @(Get-MyTeamBoardActiveItems -Organization $Organization `
+            -Project $Project -PAT $PAT)
+        Write-TTDebugLog "Get-ScrumReportData: activeItems=$($activeItems.Count)"
+    }
+    catch {
+        Write-TTDebugLog "Get-ScrumReportData active error: $($_.Exception.Message)"
+    }
+
+    return @{
+        ClosedItems    = @($closedItems)
+        CommentedItems = @($commentedItems)
+        EditedItems    = @($editedItems)
+        FollowUpItems  = @($followUpItems)
+        ActiveItems    = @($activeItems)
+    }
+}
+
+# ── Get items in the "Active" board column on teams I belong to ────
+function Get-MyTeamBoardActiveItems {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT
+    )
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+    $encodedProject = [Uri]::EscapeDataString($Project)
+
+    # Get teams I am a member of ($mine=true filters server-side)
+    $teamsUrl = "https://dev.azure.com/$Organization/_apis/projects/$encodedProject/teams?`$mine=true&api-version=7.1"
+    $myTeams = @()
+    try {
+        $teamsResult = Invoke-RestMethod -Uri $teamsUrl -Method Get -Headers $headers -ErrorAction Stop
+        $myTeams = @($teamsResult.value)
+        Write-TTDebugLog "Get-MyTeamBoardActiveItems: $($myTeams.Count) teams (mine)"
+    }
+    catch {
+        Write-TTDebugLog "Get-MyTeamBoardActiveItems: teams error: $($_.Exception.Message)"
+        return @()
+    }
+
+    if ($myTeams.Count -eq 0) { return @() }
+
+    # For each team, run a WIQL query scoped to that team so
+    # System.BoardColumn resolves against that team's board.
+    $allActiveIds = [System.Collections.Generic.HashSet[int]]::new()
+
+    foreach ($team in $myTeams) {
+        $encodedTeam = [Uri]::EscapeDataString($team.name)
+        $wiqlUrl = "https://dev.azure.com/$Organization/$encodedProject/$encodedTeam/_apis/wit/wiql?api-version=7.1"
+
+        $wiql = @{
+            query = @"
+SELECT [System.Id]
+FROM WorkItems
+WHERE [System.AssignedTo] = @me
+  AND [System.BoardColumn] = 'Active'
+ORDER BY [System.ChangedDate] DESC
+"@
+        } | ConvertTo-Json
+
+        try {
+            $result = Invoke-RestMethod -Uri $wiqlUrl -Method Post -Headers $headers `
+                -ContentType "application/json" -Body $wiql -ErrorAction Stop
+            if ($result.workItems) {
+                foreach ($wi in $result.workItems) {
+                    [void]$allActiveIds.Add([int]$wi.id)
+                }
+            }
+            Write-TTDebugLog "Get-MyTeamBoardActiveItems: team '$($team.name)' -> $($result.workItems.Count) items"
+        }
+        catch {
+            Write-TTDebugLog "Get-MyTeamBoardActiveItems: team '$($team.name)' WIQL error: $($_.Exception.Message)"
+        }
+    }
+
+    if ($allActiveIds.Count -eq 0) { return @() }
+
+    $ids = @($allActiveIds)
+    return @(Get-WorkItemDetailsFromIds -Organization $Organization -Project $Project -PAT $PAT -Ids $ids)
 }

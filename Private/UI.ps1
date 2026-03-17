@@ -201,7 +201,9 @@ function Render-WorkItemList {
         [int]$ActiveTabIndex = -1,
         [bool]$ShowAllEnabled = $false,
         [bool]$ShowAllAvailable = $false,
-        [string]$NoItemsMessage = "No work items found."
+        [string]$NoItemsMessage = "No work items found.",
+        [bool]$SearchActive = $false,
+        [string]$SearchQuery = ""
     )
 
     [Console]::CursorVisible = $false
@@ -226,9 +228,13 @@ function Render-WorkItemList {
     if ($ShowAllAvailable) {
         $helpParts += if ($ShowAllEnabled) { "  [x] Active only" } else { "  [x] Show all" }
     }
-    if ($ActiveTabIndex -eq 4) { $helpParts += "  [/] Search" }
-    if ($ActiveTabIndex -eq 5) { $helpParts += "  [/] Set Parent" }
-    if ($TabNames.Count -gt 0) { $helpParts += "  [Tab] Switch tab" }
+    if ($SearchActive) {
+        $helpParts = " [ESC] Clear filter  [Arrows] Navigate  [Enter] Info  [t] Timer  [Backspace] Delete char "
+    }
+    elseif ($ActiveTabIndex -eq 4) { $helpParts += "  [/] Search" }
+    elseif ($ActiveTabIndex -eq 5) { $helpParts += "  [/] Set Parent" }
+    else { $helpParts += "  [/] Filter" }
+    if (-not $SearchActive -and $TabNames.Count -gt 0) { $helpParts += "  [Tab] Switch tab" }
     $helpParts += "  [q] Quit "
     $helpLine = $helpParts
     $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
@@ -239,7 +245,11 @@ function Render-WorkItemList {
 
     if ($Items.Count -eq 0) {
         Write-Host ""
-        Write-Host "  $NoItemsMessage" -ForegroundColor Yellow
+        if ($SearchActive -and $SearchQuery.Length -gt 0) {
+            Write-Host "  No matches for '$SearchQuery'" -ForegroundColor Yellow
+        } else {
+            Write-Host "  $NoItemsMessage" -ForegroundColor Yellow
+        }
         Write-Host "  Press 'r' to refresh or 'q' to quit." -ForegroundColor Gray
         $remaining = $availableLines - 2
         for ($l = 0; $l -lt $remaining; $l++) {
@@ -333,7 +343,15 @@ function Render-WorkItemList {
     $timerCount = $ActiveTimers.Count
     $timerInfo = if ($timerCount -gt 0) { " | $timerCount timer(s) active" } else { "" }
 
-    if ($StatusMessage) {
+    if ($SearchActive) {
+        $cursor = "_"
+        $matchWord = if ($Items.Count -eq 1) { "match" } else { "matches" }
+        $matchInfo = if ($SearchQuery.Length -gt 0) { "  ($($Items.Count) $matchWord)" } else { "  (type to filter)" }
+        $statusText = " /$SearchQuery$cursor$matchInfo$timerInfo"
+        $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
+        Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkMagenta -NoNewline
+    }
+    elseif ($StatusMessage) {
         $statusText = " $StatusMessage$timerInfo"
         $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
         Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkGreen -NoNewline
@@ -1396,4 +1414,193 @@ function Render-PriSearchForm {
         $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
         Write-Host $statusPadded -ForegroundColor Gray -BackgroundColor DarkGray -NoNewline
     }
+}
+
+# ── Copy text to system clipboard ──────────────────────────────────
+function Set-TTClipboard {
+    param([string]$Text)
+    try {
+        Set-Clipboard -Value $Text -ErrorAction Stop
+        return $true
+    } catch {}
+    # Fallback for Linux
+    if ($IsLinux) {
+        foreach ($tool in @('xclip', 'xsel', 'wl-copy')) {
+            if (Get-Command $tool -ErrorAction SilentlyContinue) {
+                try {
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+                    $psi = [System.Diagnostics.ProcessStartInfo]::new($tool)
+                    if ($tool -eq 'xclip') { $psi.Arguments = '-selection clipboard' }
+                    elseif ($tool -eq 'xsel') { $psi.Arguments = '--clipboard --input' }
+                    $psi.RedirectStandardInput = $true
+                    $psi.UseShellExecute = $false
+                    $psi.CreateNoWindow = $true
+                    $p = [System.Diagnostics.Process]::Start($psi)
+                    $p.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+                    $p.StandardInput.Close()
+                    $p.WaitForExit(5000)
+                    if ($p.ExitCode -eq 0) { return $true }
+                } catch {}
+            }
+        }
+    }
+    elseif ($IsMacOS) {
+        try {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new('pbcopy')
+            $psi.RedirectStandardInput = $true
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $p.StandardInput.Write($Text)
+            $p.StandardInput.Close()
+            $p.WaitForExit(5000)
+            return $true
+        } catch {}
+    }
+    return $false
+}
+
+# ── Build plain text scrum report ──────────────────────────────────
+function Build-ScrumReportText {
+    param([hashtable]$ReportData)
+
+    $sb = [System.Text.StringBuilder]::new()
+
+    [void]$sb.AppendLine("** What I did yesterday")
+    [void]$sb.AppendLine()
+
+    if ($ReportData.ClosedItems.Count -gt 0) {
+        [void]$sb.AppendLine("* Closed/Resolved:")
+        foreach ($item in $ReportData.ClosedItems) {
+            [void]$sb.AppendLine("  - [$($item.Type)] #$($item.Id): $($item.Title)")
+        }
+        [void]$sb.AppendLine()
+    }
+
+    if ($ReportData.CommentedItems.Count -gt 0) {
+        [void]$sb.AppendLine("* Commented on:")
+        foreach ($item in $ReportData.CommentedItems) {
+            [void]$sb.AppendLine("  - [$($item.Type)] #$($item.Id): $($item.Title)")
+        }
+        [void]$sb.AppendLine()
+    }
+
+    if ($ReportData.EditedItems.Count -gt 0) {
+        [void]$sb.AppendLine("* Edited/Updated hours:")
+        foreach ($item in $ReportData.EditedItems) {
+            [void]$sb.AppendLine("  - [$($item.Type)] #$($item.Id): $($item.Title)")
+        }
+        [void]$sb.AppendLine()
+    }
+
+    $yesterdayCount = $ReportData.ClosedItems.Count + $ReportData.CommentedItems.Count + $ReportData.EditedItems.Count
+    if ($yesterdayCount -eq 0) {
+        [void]$sb.AppendLine("  (no activity found)")
+        [void]$sb.AppendLine()
+    }
+
+    [void]$sb.AppendLine("** What I am going to do today")
+    [void]$sb.AppendLine()
+
+    if ($ReportData.FollowUpItems.Count -gt 0) {
+        [void]$sb.AppendLine("* Follow up (unanswered comments/mentions):")
+        foreach ($item in $ReportData.FollowUpItems) {
+            [void]$sb.AppendLine("  - [$($item.Type)] #$($item.Id): $($item.Title)")
+        }
+        [void]$sb.AppendLine()
+    }
+
+    if ($ReportData.ActiveItems.Count -gt 0) {
+        [void]$sb.AppendLine("* Active column on my Teams Boards:")
+        foreach ($item in $ReportData.ActiveItems) {
+            [void]$sb.AppendLine("  - [$($item.Type)] #$($item.Id): $($item.Title)")
+        }
+        [void]$sb.AppendLine()
+    }
+
+    $todayCount = $ReportData.FollowUpItems.Count + $ReportData.ActiveItems.Count
+    if ($todayCount -eq 0) {
+        [void]$sb.AppendLine("  (no items found)")
+        [void]$sb.AppendLine()
+    }
+
+    return $sb.ToString().TrimEnd()
+}
+
+# ── Render SCRUM report view ──────────────────────────────────────
+function Render-ScrumReport {
+    param(
+        [array]$Lines,
+        [int]$ScrollOffset,
+        [array]$TabNames = @(),
+        [int]$ActiveTabIndex = -1,
+        [string]$StatusMessage = ""
+    )
+
+    [Console]::CursorVisible = $false
+    [Console]::SetCursorPosition(0, 0)
+
+    $width = [Console]::WindowWidth
+    $height = [Console]::WindowHeight
+
+    # Header
+    $header = " AZURE DEVOPS TIME TRACKER "
+    $padLen = [Math]::Max(0, $width - $header.Length)
+    Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkBlue
+
+    # Tab bar
+    $tabBarLines = 0
+    if ($TabNames.Count -gt 0 -and $ActiveTabIndex -ge 0) {
+        $tabBarLines = 1
+        Render-TabBarLine -TabNames $TabNames -ActiveTabIndex $ActiveTabIndex -Width $width
+    }
+
+    # Help bar
+    $helpLine = " [Arrows/PgUp/PgDn] Scroll  [c] Copy to clipboard  [r] Refresh  [Tab] Switch tab  [q] Quit "
+    $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
+    Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
+
+    # Available lines for content
+    $availableLines = $height - 3 - $tabBarLines
+
+    for ($l = 0; $l -lt $availableLines; $l++) {
+        $lineIdx = $ScrollOffset + $l
+        if ($lineIdx -lt $Lines.Count) {
+            $lineText = $Lines[$lineIdx]
+            $padded = Format-FixedWidth -Text "  $lineText" -Width $width
+            # Color coding based on content
+            if ($lineText -match '^\*\*\s') {
+                Write-Host $padded -ForegroundColor Cyan
+            }
+            elseif ($lineText -match '^\*\s') {
+                Write-Host $padded -ForegroundColor Yellow
+            }
+            elseif ($lineText -match '^\s+-\s\[') {
+                Write-Host $padded -ForegroundColor White
+            }
+            elseif ($lineText -match '^\s+\(no ') {
+                Write-Host $padded -ForegroundColor DarkGray
+            }
+            else {
+                Write-Host $padded -ForegroundColor Gray
+            }
+        }
+        else {
+            Write-Host (" " * $width)
+        }
+    }
+
+    # Status bar
+    if ($StatusMessage) {
+        $statusText = " $StatusMessage "
+        $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
+        Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkGreen -NoNewline
+    }
+    else {
+        $scrollInfo = " Line $($ScrollOffset + 1) of $($Lines.Count)  |  Press [c] to copy report to clipboard "
+        $statusPadded = $scrollInfo + (" " * [Math]::Max(0, $width - $scrollInfo.Length))
+        Write-Host $statusPadded -ForegroundColor Gray -BackgroundColor DarkGray -NoNewline
+    }
+
+    return $ScrollOffset
 }

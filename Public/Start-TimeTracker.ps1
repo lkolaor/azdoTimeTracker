@@ -101,6 +101,9 @@ function Start-TimeTracker {
                 }
                 return [System.Collections.ArrayList]::new()
             }
+            6 {
+                return [System.Collections.ArrayList]::new()
+            }
         }
     }
 
@@ -110,10 +113,12 @@ function Start-TimeTracker {
     $selectedIndex = 0
     $scrollOffset = 0
     $statusMessage = ""
-    $mode = "list"  # list | detail | statuspicker | assigneepicker | commentpicker | fieldpicker | toolsmenu | queryform | priform
+    $mode = "list"  # list | detail | statuspicker | assigneepicker | commentpicker | fieldpicker | toolsmenu | queryform | priform | scrumreport | localsearch
     $detailScrollOffset = 0
     $detailData = $null
     $activeTimers = @{}          # hashtable: workItemId -> Stopwatch
+    $searchActive = $false       # local search filter active
+    $searchQuery  = ""           # current search string
     $statusPickerData = $null    # @{ Item; Statuses; SelectedIndex }
     $commentPickerData = $null   # @{ Item; Comments; SelectedIndex; Action }
     $fieldPickerData = $null     # @{ Item; Fields; SelectedIndex }
@@ -121,7 +126,7 @@ function Start-TimeTracker {
     $toolsMenuData = $null       # @{ SelectedIndex; MenuItems }
 
     # ── Tab State ────────────────────────────────────────────────────
-    $tabNames = @("Mine", "Mentions", "Following", "Created by me", "Query", "Pri")
+    $tabNames = @("Mine", "Mentions", "Following", "Created by me", "Query", "Pri", "Scrum")
     $activeTab = 0
     $tabState = @(
         @{ Items = $items; SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $true;  EmptyMessage = "No work items found assigned to you." }
@@ -130,6 +135,7 @@ function Start-TimeTracker {
         @{ Items = $null;  SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $false; EmptyMessage = "No work items created by you." }
         @{ Items = $null;  SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $true;  EmptyMessage = "Press / to search for work items." }
         @{ Items = $null;  SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $false; EmptyMessage = "No parent selected. Press / to set a parent work item." }
+        @{ Items = $null;  SelectedIndex = 0; ScrollOffset = 0; ShowAll = $false; Loaded = $false; EmptyMessage = "Press [r] to generate scrum report." }
     )
     $queryData = @{
         TitleContains     = ""
@@ -170,6 +176,15 @@ function Start-TimeTracker {
         $priData.HasParent   = $true
         $tabState[5].Loaded  = $false   # will load on first visit to tab
         $tabState[5].EmptyMessage = "No children or related items found for #$savedParentId."
+    }
+
+    # ── Scrum report state ────────────────────────────────────────────
+    $scrumData = @{
+        ReportData   = $null
+        ReportText   = ""
+        ReportLines  = @()
+        ScrollOffset = 0
+        Loaded       = $false
     }
 
     # ── Save a single timer ──────────────────────────────────────────
@@ -255,6 +270,24 @@ function Start-TimeTracker {
             # Always work with a filtered list of valid items (include separator rows)
             $validItems = @($items | Where-Object { ($_.Id -and $_.Title) -or $_.IsSeparator })
 
+            # Apply local search filter (title + description)
+            if ($searchActive -and $searchQuery.Length -gt 0) {
+                $sq = $searchQuery
+                $validItems = @($validItems | Where-Object {
+                    if ($_.IsSeparator) { return $false }
+                    if ($_.Title.IndexOf($sq, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+                    $rawDesc = $null
+                    if ($_.Raw -and $_.Raw.fields) {
+                        $dp = $_.Raw.fields.PSObject.Properties['System.Description']
+                        if ($dp -and $dp.Value) { $rawDesc = [string]$dp.Value }
+                    }
+                    if ($rawDesc) {
+                        return (Remove-Html -Html $rawDesc).IndexOf($sq, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                    }
+                    return $false
+                })
+            }
+
             # Ensure selectedIndex is always valid for the filtered list
             if ($selectedIndex -lt 0) { $selectedIndex = 0 }
             if ($selectedIndex -ge $validItems.Count) { $selectedIndex = [Math]::Max(0, $validItems.Count - 1) }
@@ -269,7 +302,8 @@ function Start-TimeTracker {
                         -TabNames $tabNames -ActiveTabIndex $activeTab `
                         -ShowAllEnabled $tabState[$activeTab].ShowAll `
                         -ShowAllAvailable ($activeTab -in 1, 2, 3, 5) `
-                        -NoItemsMessage $tabState[$activeTab].EmptyMessage
+                        -NoItemsMessage $tabState[$activeTab].EmptyMessage `
+                        -SearchActive $searchActive -SearchQuery $searchQuery
                     $statusMessage = ""
 
                     # If timers are running, use non-blocking input with refresh
@@ -284,6 +318,45 @@ function Start-TimeTracker {
                     }
                     else {
                         $key = [Console]::ReadKey($true)
+                    }
+
+                    # ── Search input handling ────────────────────────────────
+                    if ($searchActive) {
+                        switch ($key.Key) {
+                            'Escape' {
+                                $searchActive = $false
+                                $searchQuery  = ""
+                                $selectedIndex = 0
+                                $scrollOffset  = 0
+                                continue
+                            }
+                            'Backspace' {
+                                if ($searchQuery.Length -gt 0) {
+                                    $searchQuery = $searchQuery.Substring(0, $searchQuery.Length - 1)
+                                    $selectedIndex = 0
+                                    $scrollOffset  = 0
+                                }
+                                continue
+                            }
+                            'Enter' {
+                                # Exit search mode but keep the filtered list; open detail below
+                                $searchActive = $false
+                                # Fall through to normal Enter handling below by NOT continuing
+                            }
+                            'UpArrow'   { <# fall through to normal nav #> }
+                            'DownArrow' { <# fall through to normal nav #> }
+                            'PageUp'    { <# fall through to normal nav #> }
+                            'PageDown'  { <# fall through to normal nav #> }
+                            default {
+                                $kc = $key.KeyChar
+                                if ($kc -ne [char]0 -and -not [char]::IsControl($kc)) {
+                                    $searchQuery  += $kc
+                                    $selectedIndex = 0
+                                    $scrollOffset  = 0
+                                }
+                                continue
+                            }
+                        }
                     }
 
                     switch ($key.Key) {
@@ -676,13 +749,16 @@ function Start-TimeTracker {
                             elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
                                 $mode = "priform"
                             }
+                            elseif ($activeTab -eq 6) {
+                                $mode = "scrumreport"
+                            }
 
                             [Console]::Clear()
                         }
                         default {
-                            # Check for tab switching (digit keys 1-6) and '/' for query/pri
+                            # Check for tab switching (digit keys 1-7) and '/' for query/pri
                             $keyChar = $key.KeyChar
-                            if ($keyChar -ge '1' -and $keyChar -le '6') {
+                            if ($keyChar -ge '1' -and $keyChar -le '7') {
                                 $newTab = [int]::Parse($keyChar.ToString()) - 1
                                 if ($newTab -ne $activeTab -and $newTab -lt $tabNames.Count) {
                                     # Save current tab state
@@ -713,6 +789,9 @@ function Start-TimeTracker {
                                     elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
                                         $mode = "priform"
                                     }
+                                    elseif ($activeTab -eq 6) {
+                                        $mode = "scrumreport"
+                                    }
 
                                     [Console]::Clear()
                                 }
@@ -725,6 +804,12 @@ function Start-TimeTracker {
                                 $priData.FormState = 'input'
                                 $mode = "priform"
                                 [Console]::Clear()
+                            }
+                            elseif ($keyChar -eq '/') {
+                                $searchActive  = $true
+                                $searchQuery   = ""
+                                $selectedIndex = 0
+                                $scrollOffset  = 0
                             }
                         }
                     }
@@ -1361,6 +1446,11 @@ function Start-TimeTracker {
                                     $priData.SearchInput = ""
                                     $priData.SearchResults = @()
                                     $priData.FormState = "input"
+                                    $scrumData.Loaded = $false
+                                    $scrumData.ReportData = $null
+                                    $scrumData.ReportText = ""
+                                    $scrumData.ReportLines = @()
+                                    $scrumData.ScrollOffset = 0
                                     $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
                                     $tabState[$activeTab].Items = $items
                                     $tabState[$activeTab].Loaded = $true
@@ -1646,6 +1736,9 @@ function Start-TimeTracker {
                             elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
                                 $mode = "priform"
                             }
+                            elseif ($activeTab -eq 6) {
+                                $mode = "scrumreport"
+                            }
                             else {
                                 $mode = "list"
                             }
@@ -1653,9 +1746,9 @@ function Start-TimeTracker {
                             [Console]::Clear()
                         }
                         default {
-                            # Check for tab switching (digit keys 1-6)
+                            # Check for tab switching (digit keys 1-7)
                             $keyChar = $key.KeyChar
-                            if ($keyChar -ge '1' -and $keyChar -le '6') {
+                            if ($keyChar -ge '1' -and $keyChar -le '7') {
                                 $newTab = [int]::Parse($keyChar.ToString()) - 1
                                 if ($newTab -ne $activeTab -and $newTab -lt $tabNames.Count) {
                                     $tabState[$activeTab].SelectedIndex = $selectedIndex
@@ -1682,6 +1775,9 @@ function Start-TimeTracker {
                                     }
                                     elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
                                         $mode = "priform"
+                                    }
+                                    elseif ($activeTab -eq 6) {
+                                        $mode = "scrumreport"
                                     }
                                     else {
                                         $mode = "list"
@@ -1884,15 +1980,18 @@ function Start-TimeTracker {
                             elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
                                 $mode = 'priform'
                             }
+                            elseif ($activeTab -eq 6) {
+                                $mode = 'scrumreport'
+                            }
                             else {
                                 $mode = 'list'
                             }
                             [Console]::Clear()
                         }
                         default {
-                            # Digit keys 1-6 switch tabs
+                            # Digit keys 1-7 switch tabs
                             $keyChar = $key.KeyChar
-                            if ($keyChar -ge '1' -and $keyChar -le '6') {
+                            if ($keyChar -ge '1' -and $keyChar -le '7') {
                                 $newTab = [int]::Parse($keyChar.ToString()) - 1
                                 if ($newTab -ne $activeTab -and $newTab -lt $tabNames.Count) {
                                     $tabState[$activeTab].SelectedIndex = $selectedIndex
@@ -1920,6 +2019,9 @@ function Start-TimeTracker {
                                     elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
                                         $mode = 'priform'
                                     }
+                                    elseif ($activeTab -eq 6) {
+                                        $mode = 'scrumreport'
+                                    }
                                     else {
                                         $mode = 'list'
                                     }
@@ -1929,6 +2031,180 @@ function Start-TimeTracker {
                             elseif ($priData.FormState -eq 'input' -and $key.KeyChar -and -not [char]::IsControl($key.KeyChar)) {
                                 # Append character to search input
                                 $priData.SearchInput += $key.KeyChar
+                            }
+                        }
+                    }
+                }
+
+                "scrumreport" {
+                    # Lazy load scrum data
+                    if (-not $scrumData.Loaded) {
+                        [Console]::Clear()
+                        Write-Host "`n  Loading scrum report data..." -ForegroundColor Cyan
+                        Write-Host "  (querying yesterday's activity and today's plan)" -ForegroundColor Gray
+                        $scrumData.ReportData = Get-ScrumReportData `
+                            -Organization $config.Organization `
+                            -Project $config.Project -PAT $config.PAT
+                        $scrumData.ReportText = Build-ScrumReportText -ReportData $scrumData.ReportData
+                        $scrumData.ReportLines = @($scrumData.ReportText -split "`n")
+                        $scrumData.Loaded = $true
+                        $scrumData.ScrollOffset = 0
+                        [Console]::Clear()
+                    }
+
+                    $scrumData.ScrollOffset = Render-ScrumReport `
+                        -Lines $scrumData.ReportLines `
+                        -ScrollOffset $scrumData.ScrollOffset `
+                        -TabNames $tabNames -ActiveTabIndex $activeTab `
+                        -StatusMessage $statusMessage
+                    $statusMessage = ""
+
+                    $key = [Console]::ReadKey($true)
+
+                    switch ($key.Key) {
+                        'Escape' {
+                            $mode = "list"
+                            $activeTab = 0
+                            $items = $tabState[0].Items
+                            if (-not $items) { $items = [System.Collections.ArrayList]::new() }
+                            $selectedIndex = $tabState[0].SelectedIndex
+                            $scrollOffset = $tabState[0].ScrollOffset
+                            [Console]::Clear()
+                        }
+                        'UpArrow' {
+                            if ($scrumData.ScrollOffset -gt 0) { $scrumData.ScrollOffset-- }
+                        }
+                        'DownArrow' {
+                            $maxScroll = [Math]::Max(0, $scrumData.ReportLines.Count - ([Console]::WindowHeight - 4))
+                            if ($scrumData.ScrollOffset -lt $maxScroll) { $scrumData.ScrollOffset++ }
+                        }
+                        'PageUp' {
+                            $scrumData.ScrollOffset = [Math]::Max(0, $scrumData.ScrollOffset - ([Console]::WindowHeight - 4))
+                        }
+                        'PageDown' {
+                            $maxScroll = [Math]::Max(0, $scrumData.ReportLines.Count - ([Console]::WindowHeight - 4))
+                            $scrumData.ScrollOffset = [Math]::Min($maxScroll, $scrumData.ScrollOffset + ([Console]::WindowHeight - 4))
+                        }
+                        'R' {
+                            $scrumData.Loaded = $false
+                            $statusMessage = "Refreshing scrum report..."
+                            [Console]::Clear()
+                        }
+                        'C' {
+                            if ($scrumData.ReportText) {
+                                $copied = Set-TTClipboard -Text $scrumData.ReportText
+                                if ($copied) {
+                                    $statusMessage = "Report copied to clipboard!"
+                                }
+                                else {
+                                    $statusMessage = "Could not copy to clipboard (no clipboard tool found)"
+                                }
+                            }
+                        }
+                        'Q' {
+                            if ($activeTimers.Count -gt 0) {
+                                [Console]::Clear()
+                                Write-Host ""
+                                Write-Host "  Saving all active timers..." -ForegroundColor Yellow
+                                foreach ($timerId in @($activeTimers.Keys)) {
+                                    $timerItem = $null
+                                    foreach ($ts in $tabState) {
+                                        if ($ts.Items) {
+                                            $timerItem = $ts.Items | Where-Object { $_.Id -eq $timerId } | Select-Object -First 1
+                                            if ($timerItem) { break }
+                                        }
+                                    }
+                                    if ($timerItem) {
+                                        $msg = Save-Timer -Item $timerItem -Stopwatch $activeTimers[$timerId] -Config $config
+                                        Write-Host "  $msg" -ForegroundColor Gray
+                                    }
+                                }
+                                $activeTimers.Clear()
+                                Start-Sleep -Seconds 2
+                            }
+                            [Console]::Clear()
+                            [Console]::CursorVisible = $true
+                            Write-Host "Goodbye!" -ForegroundColor Cyan
+                            return
+                        }
+                        'Tab' {
+                            if ($key.Modifiers -band [ConsoleModifiers]::Shift) {
+                                $newTab = if ($activeTab -eq 0) { $tabNames.Count - 1 } else { $activeTab - 1 }
+                            }
+                            else {
+                                $newTab = if ($activeTab -eq ($tabNames.Count - 1)) { 0 } else { $activeTab + 1 }
+                            }
+                            $tabState[$activeTab].SelectedIndex = $selectedIndex
+                            $tabState[$activeTab].ScrollOffset = $scrollOffset
+                            $tabState[$activeTab].Items = $items
+
+                            $activeTab = $newTab
+
+                            if (-not $tabState[$activeTab].Loaded) {
+                                $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
+                                $tabState[$activeTab].Items = $items
+                                $tabState[$activeTab].Loaded = $true
+                            }
+                            else {
+                                $items = $tabState[$activeTab].Items
+                                if (-not $items) { $items = [System.Collections.ArrayList]::new() }
+                            }
+
+                            $selectedIndex = $tabState[$activeTab].SelectedIndex
+                            $scrollOffset = $tabState[$activeTab].ScrollOffset
+
+                            if ($activeTab -eq 4 -and (-not $queryData.HasSearched)) {
+                                $mode = "queryform"
+                            }
+                            elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
+                                $mode = "priform"
+                            }
+                            elseif ($activeTab -eq 6) {
+                                $mode = "scrumreport"
+                            }
+                            else {
+                                $mode = "list"
+                            }
+                            [Console]::Clear()
+                        }
+                        default {
+                            $keyChar = $key.KeyChar
+                            if ($keyChar -ge '1' -and $keyChar -le '7') {
+                                $newTab = [int]::Parse($keyChar.ToString()) - 1
+                                if ($newTab -ne $activeTab -and $newTab -lt $tabNames.Count) {
+                                    $tabState[$activeTab].SelectedIndex = $selectedIndex
+                                    $tabState[$activeTab].ScrollOffset = $scrollOffset
+                                    $tabState[$activeTab].Items = $items
+
+                                    $activeTab = $newTab
+
+                                    if (-not $tabState[$activeTab].Loaded) {
+                                        $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
+                                        $tabState[$activeTab].Items = $items
+                                        $tabState[$activeTab].Loaded = $true
+                                    }
+                                    else {
+                                        $items = $tabState[$activeTab].Items
+                                        if (-not $items) { $items = [System.Collections.ArrayList]::new() }
+                                    }
+
+                                    $selectedIndex = $tabState[$activeTab].SelectedIndex
+                                    $scrollOffset = $tabState[$activeTab].ScrollOffset
+
+                                    if ($activeTab -eq 4 -and (-not $queryData.HasSearched)) {
+                                        $mode = "queryform"
+                                    }
+                                    elseif ($activeTab -eq 5 -and (-not $priData.HasParent)) {
+                                        $mode = "priform"
+                                    }
+                                    elseif ($activeTab -eq 6) {
+                                        $mode = "scrumreport"
+                                    }
+                                    else {
+                                        $mode = "list"
+                                    }
+                                    [Console]::Clear()
+                                }
                             }
                         }
                     }
