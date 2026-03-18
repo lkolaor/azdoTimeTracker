@@ -896,6 +896,7 @@ function ConvertTo-FlatWorkItem {
         State            = $f.'System.State'
         AssignedTo       = $assignedTo
         ParentId         = Get-SafeField -Fields $f -Name 'System.Parent'
+        TeamProject      = Get-SafeField -Fields $f -Name 'System.TeamProject'
         OriginalEstimate = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.OriginalEstimate'
         CompletedWork    = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.CompletedWork'
         RemainingWork    = Get-SafeField -Fields $f -Name 'Microsoft.VSTS.Scheduling.RemainingWork'
@@ -931,6 +932,7 @@ function Get-WorkItemDetailsFromIds {
         "System.AssignedTo",
         "System.Description",
         "System.Parent",
+        "System.TeamProject",
         "Microsoft.VSTS.Scheduling.OriginalEstimate",
         "Microsoft.VSTS.Scheduling.CompletedWork",
         "Microsoft.VSTS.Scheduling.RemainingWork"

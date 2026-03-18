@@ -261,7 +261,7 @@ All items in the report are selectable — use `↑`/`↓` to navigate and `Ente
 |-----|--------|
 | `↑` / `↓` | Navigate between items |
 | `Enter` | View item details |
-| `c` | Copy report to clipboard as rich HTML (with clickable links, suitable for pasting into Microsoft Teams) |
+| `c` | Copy report to clipboard as rich HTML (with clickable `#Id` links, suitable for pasting into Microsoft Teams) |
 | `l` | Cycle report language (English → Nynorsk → Bokmål) |
 | `r` | Refresh report data |
 | `Page Up` / `Page Down` | Jump selection by page |

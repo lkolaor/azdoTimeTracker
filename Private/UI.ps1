@@ -1536,10 +1536,15 @@ function Build-ScrumClipboardText {
 
     # Helper to build a linked item line
     function ItemHtml($item) {
-        $url = "https://dev.azure.com/$Organization/$encodedProject/_workitems/edit/$($item.Id)"
+        # Use the item's own TeamProject field so cross-project items get the correct URL.
+        $itemProject = if ($item.TeamProject) { [Uri]::EscapeDataString($item.TeamProject) } else { $encodedProject }
+        $url = "https://dev.azure.com/$Organization/$itemProject/_workitems/edit/$($item.Id)"
+        Write-TTDebugLog "ItemHtml: #$($item.Id) project='$($item.TeamProject)' url=$url"
         $type = HtmlEncode $item.Type
         $title = HtmlEncode $item.Title
-        return "<li>[$type] <a href=`"$url`">#$($item.Id): $title</a></li>"
+        # Keep the anchor text short (#Id only) so Teams doesn't strip the link
+        # when the work item title is very long.
+        return "<li>[$type] <a href=`"$url`">#$($item.Id)</a>: $title</li>"
     }
 
     [void]$sb.AppendLine("<b>$($str.Yesterday)</b><br>")
