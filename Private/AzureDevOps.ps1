@@ -860,6 +860,72 @@ function Update-WorkItemField {
         throw "Error updating field '${FieldPath}' on work item ${WorkItemId}: $($_.Exception.Message)"
     }
 }
+# ── Set (or change) the parent of a work item ─────────────────────
+function Set-WorkItemParent {
+    param(
+        [string]$Organization,
+        [string]$Project,
+        [string]$PAT,
+        [int]$WorkItemId,
+        [int]$NewParentId
+    )
+
+    $headers = Get-AzDoAuthHeader -PAT $PAT
+
+    # Fetch work item with all relations so we know the current parent index
+    $wiUrl = "https://dev.azure.com/$Organization/$Project/_apis/wit/workitems/${WorkItemId}?`$expand=relations&api-version=7.1"
+    $wi = Invoke-RestMethod -Uri $wiUrl -Method Get -Headers $headers -ErrorAction Stop
+
+    $patchOps = [System.Collections.ArrayList]::new()
+
+    # Find and remove existing parent relation (Hierarchy-Reverse = "I am a child of")
+    # We need to scan from high to low index so subsequent removes don't shift indices,
+    # but since there can only be ONE parent we'll just track the single match.
+    if ($wi.relations) {
+        for ($i = 0; $i -lt $wi.relations.Count; $i++) {
+            if ($wi.relations[$i].rel -eq 'System.LinkTypes.Hierarchy-Reverse') {
+                [void]$patchOps.Add([ordered]@{
+                    op   = 'remove'
+                    path = "/relations/$i"
+                })
+                break   # only one parent is possible
+            }
+        }
+    }
+
+    # Add new parent relation
+    [void]$patchOps.Add([ordered]@{
+        op    = 'add'
+        path  = '/relations/-'
+        value = [ordered]@{
+            rel = 'System.LinkTypes.Hierarchy-Reverse'
+            url = "https://dev.azure.com/$Organization/$Project/_apis/wit/workitems/$NewParentId"
+        }
+    })
+
+    $apiUrl = "https://dev.azure.com/$Organization/$Project/_apis/wit/workitems/${WorkItemId}?api-version=7.1"
+    $body = ConvertTo-Json -InputObject @($patchOps) -Depth 10 -Compress
+    Write-TTDebugLog "Set-WorkItemParent: WI=$WorkItemId NewParent=$NewParentId ops=$($patchOps.Count) Body=$body"
+
+    try {
+        Invoke-RestMethod -Uri $apiUrl -Method Patch -Headers $headers `
+            -ContentType 'application/json-patch+json' `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ErrorAction Stop | Out-Null
+    }
+    catch {
+        $errDetail = $_.Exception.Message
+        try {
+            $stream = $_.Exception.Response.GetResponseStream()
+            $reader = [System.IO.StreamReader]::new($stream)
+            $respBody = $reader.ReadToEnd()
+            $reader.Close()
+            Write-TTDebugLog "Set-WorkItemParent ERROR response: $respBody"
+            $errDetail = "$errDetail | $respBody"
+        } catch { }
+        throw "Error re-parenting work item ${WorkItemId}: $errDetail"
+    }
+}
+
 # ── Delete (soft-delete) a work item ───────────────────────────
 function Remove-WorkItem {
     param(

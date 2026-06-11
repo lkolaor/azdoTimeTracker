@@ -197,6 +197,7 @@ function Render-WorkItemList {
         [int]$ScrollOffset,
         [string]$StatusMessage = "",
         [hashtable]$ActiveTimers = @{},
+        [System.Collections.Generic.HashSet[int]]$SelectedItemIds = $null,
         [array]$TabNames = @(),
         [int]$ActiveTabIndex = -1,
         [bool]$ShowAllEnabled = $false,
@@ -224,7 +225,7 @@ function Render-WorkItemList {
         Render-TabBarLine -TabNames $TabNames -ActiveTabIndex $ActiveTabIndex -Width $width
     }
 
-    $helpParts = " [Arrows] Navigate  [Enter] Info  [t] Timer  [r] Refresh  [m] Tools"
+    $helpParts = " [Arrows] Navigate  [Enter] Info  [t] Timer  [Space] Select  [r] Refresh  [m] Tools"
     if ($ShowAllAvailable) {
         $helpParts += if ($ShowAllEnabled) { "  [x] Active only" } else { "  [x] Show all" }
     }
@@ -235,6 +236,7 @@ function Render-WorkItemList {
     elseif ($ActiveTabIndex -eq 5) { $helpParts += "  [/] Set Parent" }
     else { $helpParts += "  [/] Filter" }
     if (-not $SearchActive -and $TabNames.Count -gt 0) { $helpParts += "  [Tab] Switch tab" }
+    if ($SelectedItemIds -and $SelectedItemIds.Count -gt 0) { $helpParts += "  [p] Re-parent" }
     $helpParts += "  [q] Quit "
     $helpLine = $helpParts
     $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
@@ -303,8 +305,13 @@ function Render-WorkItemList {
                 }
 
                 $prefix = "  "
-                if ($idx -eq $SelectedIndex) {
+                $isItemSelected = $SelectedItemIds -and $item.Id -and $SelectedItemIds.Contains([int]$item.Id)
+                if ($idx -eq $SelectedIndex -and $isItemSelected) {
+                    $prefix = "*>"
+                } elseif ($idx -eq $SelectedIndex) {
                     $prefix = "> "
+                } elseif ($isItemSelected) {
+                    $prefix = "* "
                 }
 
                 $lineText = "$prefix$indent$icon $($item.Id)/$($item.State): $($item.Title)$timeStr$timerStr"
@@ -315,12 +322,21 @@ function Render-WorkItemList {
                     if ($idx -eq $SelectedIndex) {
                         Write-Host $padded -ForegroundColor White -BackgroundColor DarkYellow
                     }
+                    elseif ($isItemSelected) {
+                        Write-Host $padded -ForegroundColor DarkYellow -BackgroundColor DarkGreen
+                    }
                     else {
                         Write-Host $padded -ForegroundColor DarkYellow
                     }
                 }
+                elseif ($idx -eq $SelectedIndex -and $isItemSelected) {
+                    Write-Host $padded -ForegroundColor White -BackgroundColor DarkGreen
+                }
                 elseif ($idx -eq $SelectedIndex) {
                     Write-Host $padded -ForegroundColor White -BackgroundColor DarkCyan
+                }
+                elseif ($isItemSelected) {
+                    Write-Host $padded -ForegroundColor Black -BackgroundColor DarkGreen
                 }
                 elseif ($item.IsRelated) {
                     Write-Host $padded -ForegroundColor Yellow
@@ -342,25 +358,30 @@ function Render-WorkItemList {
     # Status bar
     $timerCount = $ActiveTimers.Count
     $timerInfo = if ($timerCount -gt 0) { " | $timerCount timer(s) active" } else { "" }
+    $selCount = if ($SelectedItemIds) { $SelectedItemIds.Count } else { 0 }
+    $selInfo = if ($selCount -gt 0) { " | $selCount selected" } else { "" }
 
     if ($SearchActive) {
         $cursor = "_"
         $matchWord = if ($Items.Count -eq 1) { "match" } else { "matches" }
         $matchInfo = if ($SearchQuery.Length -gt 0) { "  ($($Items.Count) $matchWord)" } else { "  (type to filter)" }
-        $statusText = " /$SearchQuery$cursor$matchInfo$timerInfo"
+        $statusText = " /$SearchQuery$cursor$matchInfo$timerInfo$selInfo"
         $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
         Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkMagenta -NoNewline
     }
     elseif ($StatusMessage) {
-        $statusText = " $StatusMessage$timerInfo"
+        $statusText = " $StatusMessage$timerInfo$selInfo"
         $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
         Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkGreen -NoNewline
     }
     else {
-        $countMsg = " $($Items.Count) items$timerInfo"
+        $countMsg = " $($Items.Count) items$timerInfo$selInfo"
         $statusPadded = $countMsg + (" " * [Math]::Max(0, $width - $countMsg.Length))
         if ($timerCount -gt 0) {
             Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkRed -NoNewline
+        }
+        elseif ($selCount -gt 0) {
+            Write-Host $statusPadded -ForegroundColor White -BackgroundColor DarkGreen -NoNewline
         }
         else {
             Write-Host $statusPadded -ForegroundColor Gray -BackgroundColor DarkGray -NoNewline
@@ -1192,6 +1213,123 @@ function Read-WithSuggestions {
             }
         }
     }
+}
+
+# ── Render Re-parent picker ──────────────────────────────────────
+function Render-ReparentPicker {
+    param(
+        [System.Collections.Generic.HashSet[int]]$SelectedItemIds,
+        [System.Collections.ArrayList]$AllItems,   # current list (for previewing titles)
+        [hashtable]$PickerData   # SearchInput, SearchResults, SearchResultIndex, FormState
+    )
+
+    [Console]::CursorVisible = $false
+    [Console]::SetCursorPosition(0, 0)
+
+    $width  = [Console]::WindowWidth
+    $height = [Console]::WindowHeight
+
+    # Header
+    $header = " RE-PARENT SELECTED ITEMS "
+    $padLen = [Math]::Max(0, $width - $header.Length)
+    Write-Host ($header + (" " * $padLen)) -ForegroundColor White -BackgroundColor DarkMagenta
+
+    $inResults = $PickerData.FormState -eq 'results'
+    $helpLine = if ($inResults) {
+        " [Up/Down] Select new parent  [Enter] Confirm re-parent  [ESC] Back to search  [Ctrl+C] Cancel "
+    } else {
+        " [Type] Search by title  [Enter] Search  [Backspace] Delete  [ESC] Cancel "
+    }
+    $padLen2 = [Math]::Max(0, $width - $helpLine.Length)
+    Write-Host ($helpLine + (" " * $padLen2)) -ForegroundColor Gray -BackgroundColor DarkGray
+
+    # Section title
+    Write-Host ""
+    $selCount = $SelectedItemIds.Count
+    Write-Host "  Re-parenting $selCount selected item(s):" -ForegroundColor Cyan
+
+    $usedLines = 4  # header + help + blank + title
+
+    # Show selected items (up to 5, then "and N more...")
+    $previewMax = 5
+    $previewCount = 0
+    foreach ($item in $AllItems) {
+        if ($item.IsSeparator -or -not $item.Id) { continue }
+        if ($SelectedItemIds.Contains([int]$item.Id)) {
+            $icon = Get-TypeIcon -Type $item.Type
+            $typeColor = Get-TypeColor -Type $item.Type
+            $lineText = "    $icon #$($item.Id): $($item.Title)"
+            $padded = Format-FixedWidth -Text $lineText -Width $width
+            Write-Host $padded -ForegroundColor $typeColor
+            $usedLines++
+            $previewCount++
+            if ($previewCount -ge $previewMax) { break }
+        }
+    }
+    if ($selCount -gt $previewMax) {
+        Write-Host (Format-FixedWidth -Text "    ... and $($selCount - $previewMax) more" -Width $width) -ForegroundColor DarkGray
+        $usedLines++
+    }
+
+    Write-Host ""
+    $usedLines++
+
+    # Search input line
+    $inputLabel = "  Search new parent (title or ID): "
+    $inputVal   = if ($PickerData.SearchInput) { $PickerData.SearchInput } else { "" }
+    $inputLine  = "$inputLabel[$inputVal]_"
+    $paddedInput = Format-FixedWidth -Text $inputLine -Width $width
+    if (-not $inResults) {
+        Write-Host $paddedInput -ForegroundColor White -BackgroundColor DarkCyan
+    } else {
+        Write-Host $paddedInput -ForegroundColor White
+    }
+    $usedLines++
+
+    # Results list
+    if ($inResults -and $PickerData.SearchResults.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Results ($($PickerData.SearchResults.Count) found) - select the new parent:" -ForegroundColor Gray
+        $usedLines += 2
+
+        $maxResults = $height - $usedLines - 2
+        if ($maxResults -lt 1) { $maxResults = 1 }
+
+        for ($i = 0; $i -lt [Math]::Min($PickerData.SearchResults.Count, $maxResults); $i++) {
+            $r = $PickerData.SearchResults[$i]
+            $icon = Get-TypeIcon -Type $r.Type
+            $prefix = if ($i -eq $PickerData.SearchResultIndex) { "  > " } else { "    " }
+            $stateStr = if ($r.State) { "[$($r.State)] " } else { "" }
+            $lineText = "$prefix$icon #$($r.Id) $stateStr$($r.Title)"
+            $padded2 = Format-FixedWidth -Text $lineText -Width $width
+            if ($i -eq $PickerData.SearchResultIndex) {
+                Write-Host $padded2 -ForegroundColor White -BackgroundColor DarkCyan
+            } else {
+                $typeColor = Get-TypeColor -Type $r.Type
+                Write-Host $padded2 -ForegroundColor $typeColor
+            }
+            $usedLines++
+        }
+    } elseif ($inResults -and $PickerData.SearchResults.Count -eq 0) {
+        Write-Host ""
+        Write-Host (Format-FixedWidth -Text "  No results found. Press ESC to search again." -Width $width) -ForegroundColor DarkGray
+        $usedLines += 2
+    }
+
+    # Fill remaining lines
+    $remaining = $height - $usedLines - 2
+    for ($l = 0; $l -lt $remaining; $l++) {
+        Write-Host (" " * $width)
+    }
+
+    # Status bar
+    $statusText = if ($inResults) {
+        " Select the new parent and press Enter to re-parent $selCount item(s) "
+    } else {
+        " Enter a title (partial match) or work item ID, then press Enter to search "
+    }
+    $statusPadded = $statusText + (" " * [Math]::Max(0, $width - $statusText.Length))
+    Write-Host $statusPadded -ForegroundColor Gray -BackgroundColor DarkGray -NoNewline
 }
 
 # ── Render query form ───────────────────────────────────────────────

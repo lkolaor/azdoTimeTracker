@@ -124,6 +124,8 @@ function Start-TimeTracker {
     $fieldPickerData = $null     # @{ Item; Fields; SelectedIndex }
     $assigneePickerData = $null   # @{ Item; SearchText; Results; SelectedIndex; LastSearchText }
     $toolsMenuData = $null       # @{ SelectedIndex; MenuItems }
+    $selectedItemIds = [System.Collections.Generic.HashSet[int]]::new()  # multi-select
+    $reparentPickerData = $null  # @{ SearchInput; SearchResults; SearchResultIndex; FormState }
 
     # ── Tab State ────────────────────────────────────────────────────
     $tabNames = @("Mine", "Mentions", "Following", "Created by me", "Query", "Pri", "Scrum")
@@ -308,6 +310,7 @@ function Start-TimeTracker {
                     $scrollOffset = Render-WorkItemList -Items $validItems `
                         -SelectedIndex $selectedIndex -ScrollOffset $scrollOffset `
                         -StatusMessage $statusMessage -ActiveTimers $activeTimers `
+                        -SelectedItemIds $selectedItemIds `
                         -TabNames $tabNames -ActiveTabIndex $activeTab `
                         -ShowAllEnabled $tabState[$activeTab].ShowAll `
                         -ShowAllAvailable ($activeTab -in 1, 2, 3, 5) `
@@ -396,6 +399,20 @@ function Start-TimeTracker {
                         }
                         'End' {
                             $selectedIndex = $validItems.Count - 1
+                        }
+                        'Spacebar' {
+                            # Toggle selection of current item
+                            if ($validItems.Count -gt 0) {
+                                $item = $validItems[$selectedIndex]
+                                if (-not $item.IsSeparator -and $item.Id) {
+                                    $id = [int]$item.Id
+                                    if ($selectedItemIds.Contains($id)) {
+                                        [void]$selectedItemIds.Remove($id)
+                                    } else {
+                                        [void]$selectedItemIds.Add($id)
+                                    }
+                                }
+                            }
                         }
                         'R' {
                             if ($activeTab -eq 5 -and $priData.HasParent) {
@@ -666,6 +683,21 @@ function Start-TimeTracker {
                                 }
                             }
                         }
+                        'P' {
+                            # Re-parent selected items
+                            if ($selectedItemIds.Count -eq 0) {
+                                $statusMessage = "No items selected. Press [Space] to select items, then [p] to re-parent."
+                            } else {
+                                $reparentPickerData = @{
+                                    SearchInput       = ""
+                                    SearchResults     = @()
+                                    SearchResultIndex = 0
+                                    FormState         = "input"
+                                }
+                                $mode = "reparentpicker"
+                                [Console]::Clear()
+                            }
+                        }
                         'M' {
                             # Open Tools menu
                             $toolsMenuData = @{
@@ -739,6 +771,7 @@ function Start-TimeTracker {
                             $tabState[$activeTab].Items = $items
 
                             $activeTab = $newTab
+                            $selectedItemIds.Clear()  # clear multi-selection on tab switch
 
                             if (-not $tabState[$activeTab].Loaded) {
                                 $items = [System.Collections.ArrayList]@(Refresh-TabItems -Config $config -TabIndex $activeTab -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
@@ -777,6 +810,7 @@ function Start-TimeTracker {
                                     $tabState[$activeTab].Items = $items
 
                                     $activeTab = $newTab
+                                    $selectedItemIds.Clear()  # clear multi-selection on tab switch
 
                                     # Load tab if needed
                                     if (-not $tabState[$activeTab].Loaded) {
@@ -2344,6 +2378,161 @@ function Start-TimeTracker {
                                     }
                                     [Console]::Clear()
                                 }
+                            }
+                        }
+                    }
+                }
+
+                "reparentpicker" {
+                    Render-ReparentPicker `
+                        -SelectedItemIds $selectedItemIds `
+                        -AllItems $validItems `
+                        -PickerData $reparentPickerData
+
+                    $key = [Console]::ReadKey($true)
+                    $inResults = $reparentPickerData.FormState -eq 'results'
+
+                    switch ($key.Key) {
+                        'Escape' {
+                            if ($inResults) {
+                                $reparentPickerData.FormState = 'input'
+                                $reparentPickerData.SearchResults = @()
+                                $reparentPickerData.SearchResultIndex = 0
+                            } else {
+                                $reparentPickerData = $null
+                                $mode = 'list'
+                                [Console]::Clear()
+                            }
+                        }
+                        'UpArrow' {
+                            if ($inResults -and $reparentPickerData.SearchResultIndex -gt 0) {
+                                $reparentPickerData.SearchResultIndex--
+                            }
+                        }
+                        'DownArrow' {
+                            if ($inResults) {
+                                $maxIdx = [Math]::Max(0, $reparentPickerData.SearchResults.Count - 1)
+                                if ($reparentPickerData.SearchResultIndex -lt $maxIdx) {
+                                    $reparentPickerData.SearchResultIndex++
+                                }
+                            }
+                        }
+                        'Backspace' {
+                            if (-not $inResults -and $reparentPickerData.SearchInput.Length -gt 0) {
+                                $reparentPickerData.SearchInput = $reparentPickerData.SearchInput.Substring(
+                                    0, $reparentPickerData.SearchInput.Length - 1)
+                            }
+                        }
+                        'Enter' {
+                            if ($inResults) {
+                                # Confirm: re-parent all selected items to the chosen new parent
+                                $newParent = $reparentPickerData.SearchResults[$reparentPickerData.SearchResultIndex]
+                                $newParentId = $newParent.Id
+                                $idsToReparent = @($selectedItemIds)
+
+                                [Console]::Clear()
+                                [Console]::CursorVisible = $true
+                                Write-Host ""
+                                Write-Host "  Re-parenting $($idsToReparent.Count) item(s) to #$newParentId '$($newParent.Title)' ..." -ForegroundColor Cyan
+                                Write-Host ""
+
+                                $ok = 0
+                                $fail = 0
+                                foreach ($wiId in $idsToReparent) {
+                                    Write-Host "  Processing #$wiId ..." -ForegroundColor Gray -NoNewline
+                                    try {
+                                        Set-WorkItemParent -Organization $config.Organization `
+                                            -Project $config.Project -PAT $config.PAT `
+                                            -WorkItemId $wiId -NewParentId $newParentId
+                                        Write-Host " OK" -ForegroundColor Green
+                                        $ok++
+                                    } catch {
+                                        Write-Host " FAILED: $($_.Exception.Message)" -ForegroundColor Red
+                                        $fail++
+                                    }
+                                }
+
+                                Write-Host ""
+                                if ($fail -gt 0) {
+                                    Write-Host "  Done: $ok succeeded, $fail failed." -ForegroundColor Yellow
+                                } else {
+                                    Write-Host "  Done: all $ok item(s) re-parented successfully." -ForegroundColor Green
+                                }
+                                Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
+                                $null = [Console]::ReadKey($true)
+                                [Console]::CursorVisible = $false
+
+                                # Update ParentId on re-parented items in local list
+                                foreach ($item in $validItems) {
+                                    if (-not $item.IsSeparator -and $item.Id -and $selectedItemIds.Contains([int]$item.Id)) {
+                                        $item['ParentId'] = $newParentId
+                                    }
+                                }
+
+                                $statusMsg = if ($fail -gt 0) {
+                                    "Re-parent: $ok OK, $fail failed - to #$newParentId"
+                                } else {
+                                    "Re-parented $ok item(s) to #$newParentId"
+                                }
+                                $selectedItemIds.Clear()
+                                $reparentPickerData = $null
+
+                                # Refresh the current tab so the new parent links are shown
+                                [Console]::Clear()
+                                Write-Host "`n  Refreshing..." -ForegroundColor Cyan
+                                $items = [System.Collections.ArrayList]@(
+                                    Refresh-TabItems -Config $config -TabIndex $activeTab `
+                                        -ShowAll $tabState[$activeTab].ShowAll -PriData $priData)
+                                $tabState[$activeTab].Items = $items
+                                $tabState[$activeTab].Loaded = $true
+                                $selectedIndex = 0
+                                $scrollOffset  = 0
+
+                                $mode = 'list'
+                                $statusMessage = $statusMsg
+                                [Console]::Clear()
+                            } else {
+                                # Search for the new parent
+                                $searchInput = $reparentPickerData.SearchInput.Trim()
+                                if ($searchInput -eq '') {
+                                    # Do nothing, stay in input
+                                } elseif ($searchInput -match '^\d+$') {
+                                    # Fetch by ID
+                                    [Console]::Clear()
+                                    Write-Host "`n  Fetching work item #$searchInput..." -ForegroundColor Cyan
+                                    $parentDetail = Get-WorkItemDetail -Organization $config.Organization `
+                                        -Project $config.Project -PAT $config.PAT -WorkItemId ([int]$searchInput)
+                                    if ($parentDetail) {
+                                        $reparentPickerData.SearchResults = @(ConvertTo-FlatWorkItem -RawItem $parentDetail)
+                                        $reparentPickerData.SearchResultIndex = 0
+                                        $reparentPickerData.FormState = 'results'
+                                    } else {
+                                        $statusMessage = "Work item #$searchInput not found"
+                                    }
+                                    [Console]::Clear()
+                                } else {
+                                    # Search by title
+                                    [Console]::Clear()
+                                    Write-Host "`n  Searching for '$searchInput'..." -ForegroundColor Cyan
+                                    $searchResults = @(Search-WorkItemsByFilters `
+                                        -Organization $config.Organization `
+                                        -Project $config.Project -PAT $config.PAT `
+                                        -TitleContains $searchInput)
+                                    if ($searchResults.Count -eq 0) {
+                                        $statusMessage = "No items found matching '$searchInput'"
+                                        [Console]::Clear()
+                                    } else {
+                                        $reparentPickerData.SearchResults     = $searchResults
+                                        $reparentPickerData.SearchResultIndex = 0
+                                        $reparentPickerData.FormState         = 'results'
+                                        [Console]::Clear()
+                                    }
+                                }
+                            }
+                        }
+                        default {
+                            if (-not $inResults -and $key.KeyChar -and -not [char]::IsControl($key.KeyChar)) {
+                                $reparentPickerData.SearchInput += $key.KeyChar
                             }
                         }
                     }
