@@ -12,7 +12,7 @@
 RootModule = 'AzDoTimeTracker.psm1'
 
 # Version number of this module.
-ModuleVersion = '1.6.1'
+ModuleVersion = '1.7.0'
 
 # Supported PSEditions
 # CompatiblePSEditions = @()
